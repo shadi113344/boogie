@@ -102,6 +102,12 @@ export function quatRotate(q: Quat, v: Vec3): Vec3 {
   };
 }
 
+/** The head of the canonical body frame: it points north. */
+const CANONICAL_FORWARD: Vec3 = { x: 0, y: 0, z: -1 };
+
+/** The back of the canonical body frame: it points up. */
+const CANONICAL_UP: Vec3 = { x: 0, y: 1, z: 0 };
+
 /** A unit vector perpendicular to `v`, or the zero vector if `v` is zero. */
 function perpendicularTo(v: Vec3): Vec3 {
   const ax = Math.abs(v.x);
@@ -133,4 +139,27 @@ export function quatNormalize(q: Quat): Quat {
   const len = Math.hypot(q.x, q.y, q.z, q.w);
   if (len === 0) return quatIdentity();
   return { x: q.x / len, y: q.y / len, z: q.z / len, w: q.w / len };
+}
+
+/**
+ * The rotation that presents the canonical body frame to a pair of axes.
+ *
+ * The canonical frame has the head along (0, 0, −1), the back along
+ * (0, 1, 0) and the right hand along (1, 0, 0). This maps the canonical
+ * head onto `forward` and the canonical back onto `up`; the canonical right
+ * hand then follows as their cross product, because a rotation that keeps
+ * two axes perpendicular keeps the third one perpendicular as well. The
+ * pair has to be unit vectors at right angles to each other.
+ */
+export function quatFromBasis(forward: Vec3, up: Vec3): Quat {
+  const f = normalize(forward);
+  const u = normalize(up);
+  // Turn the canonical back onto `up` first. The canonical head stays
+  // perpendicular to the new back, because a rotation keeps angles.
+  const toUp = quatFromUnitVectors(CANONICAL_UP, u);
+  const head = quatRotate(toUp, CANONICAL_FORWARD);
+  // Then roll about `up` until the head is on `forward`.
+  const angle = Math.atan2(dot(cross(head, f), u), dot(head, f));
+  const aboutUp = quatFromAxisAngle(u, angle);
+  return quatNormalize(quatMultiply(aboutUp, toUp));
 }

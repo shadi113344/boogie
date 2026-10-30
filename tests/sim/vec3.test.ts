@@ -15,6 +15,7 @@ import {
   quatRotate,
   quatFromUnitVectors,
   quatNormalize,
+  quatFromBasis,
   type Vec3,
 } from '@/sim/vec3';
 
@@ -111,5 +112,41 @@ describe('quaternions', () => {
     const b = vec3(-3, 0, 0);
     const q = quatFromUnitVectors(a, b);
     expectVecClose(quatRotate(q, a), vec3(-2, 0, 0), 9);
+  });
+});
+
+describe('quatFromBasis', () => {
+  /** The canonical body frame: head north, back up, right hand east. */
+  const HEAD = vec3(0, 0, -1);
+  const BACK = vec3(0, 1, 0);
+  const RIGHT = vec3(1, 0, 0);
+
+  it('presents the canonical frame to the pair it is given', () => {
+    const rng = new Rng(4242);
+    for (let i = 0; i < 200; i++) {
+      const up = unit(rng);
+      const seed = unit(rng);
+      const forward = normalize(sub(seed, scale(up, dot(seed, up))));
+      if (length(forward) < 1e-6) continue;
+      const q = quatFromBasis(forward, up);
+      expectVecClose(quatRotate(q, HEAD), forward, 9);
+      expectVecClose(quatRotate(q, BACK), up, 9);
+      expectVecClose(quatRotate(q, RIGHT), cross(forward, up), 9);
+    }
+  });
+
+  it('leaves the canonical frame alone when it is given the canonical frame', () => {
+    const q = quatFromBasis(HEAD, BACK);
+    expectVecClose(quatRotate(q, HEAD), HEAD, 12);
+    expectVecClose(quatRotate(q, BACK), BACK, 12);
+    expectVecClose(quatRotate(q, RIGHT), RIGHT, 12);
+  });
+
+  it('turns the head and the back together', () => {
+    // head east, back up: a quarter turn about the vertical
+    const q = quatFromBasis(vec3(1, 0, 0), BACK);
+    expectVecClose(quatRotate(q, HEAD), vec3(1, 0, 0), 9);
+    expectVecClose(quatRotate(q, BACK), BACK, 9);
+    expectVecClose(quatRotate(q, RIGHT), cross(vec3(1, 0, 0), BACK), 9);
   });
 });

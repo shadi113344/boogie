@@ -249,8 +249,8 @@ trackBlend → (input.track ? 1 : 0) with first-order lag trackBlendS
 if not tumbling:
   yawTarget = (1 − trackBlend) · input.turn · maxYawRate         // belly turns are body twist
   yawRate   → yawTarget with lag lagS;  base = quatFromAxisAngle(d, yawRate·dt) ∘ base
-  pitchTarget = (1 − trackBlend) · input.drive · 25° + trackBlend · −(90° − trimAlpha + input.drive · 4°)
-                // in the track the angle of attack is 90° + pitch: 10° at trim, 6° head-low (faster, steeper), 14° legs-out
+  pitchTarget = (1 − trackBlend) · input.drive · 25° + trackBlend · (90° − trimAlpha + input.drive · 4°)
+                // the track is a head-low rotation from the belly (the head points along the flight path): the angle of attack is 90° − pitch, 10° at trim, 6° head-low (faster, steeper), 14° legs-out
   bankTarget  = input.turn · lerp(bellyTurnBankDeg, trackTurnBankDeg, trackBlend)
   pitch, bank → targets with lag lagS and rate limit maxPitchBankRateDeg
   if trackBlend < 0.5 and (|pitch| or |bank| > tumbleLimitDeg): tumbling = true, tumbleSpin = random axis · U(90, 180) °/s

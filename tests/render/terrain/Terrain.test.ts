@@ -927,7 +927,8 @@ describe('Terrain', () => {
 
     // The ground has sharpened all the way.
     expect(Math.max(...fixture.terrain.visibleTiles.map((t) => t.z))).toBeGreaterThanOrEqual(14);
-  });
+    // 150 real-timer waits: on Windows each 1 ms wait lasts about 16 ms.
+  }, 30_000);
 
   it('never selects below a tile it cannot draw', async () => {
     // The imagery of the zoom-10 tiles never arrives, so they are never

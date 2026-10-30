@@ -22,6 +22,210 @@ body {
   pointer-events: none;
 }
 
+/* The goggle vignette: dark at the corners, clear in the middle. It stays
+   out of the way until the jump starts. */
+#vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse farthest-corner at 50% 50%,
+    rgba(0, 0, 0, 0) 40%,
+    rgba(0, 0, 0, 0.35) 100%
+  );
+}
+
+#vignette[hidden] {
+  display: none;
+}
+
+/* ---- the screen before the jump ---- */
+
+.start-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: calc(16px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font: 15px/1.5 system-ui, -apple-system, sans-serif;
+  pointer-events: auto;
+}
+
+.start-screen[hidden] {
+  display: none;
+}
+
+.start-panel {
+  width: 100%;
+  max-width: 24rem;
+}
+
+.start-dz {
+  margin: 0 0 2px;
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.start-loading {
+  margin: 0 0 18px;
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.start-choice {
+  margin-bottom: 14px;
+}
+
+.start-scheme {
+  min-height: 44px;
+  padding: 10px 18px;
+  font: inherit;
+  color: #fff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+}
+
+.start-scheme[aria-pressed='true'] {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.start-scheme-note {
+  margin: 6px 0 0;
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.start-note {
+  margin: 0 0 12px;
+  font-size: 13px;
+  opacity: 0.8;
+}
+
+.start-units {
+  margin: 0 0 20px;
+  font-size: 12px;
+  opacity: 0.45;
+}
+
+.start-jump {
+  width: 100%;
+  min-height: 48px;
+  font: inherit;
+  font-size: 16px;
+  color: #fff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+}
+
+.start-jump:disabled {
+  opacity: 0.35;
+}
+
+/* ---- the touch layer of the freefall ---- */
+
+.ff-controls {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ff-controls[hidden] {
+  display: none;
+}
+
+/* The half of the screen that changes the fall rate. */
+.ff-fall {
+  position: absolute;
+  top: 0;
+  width: 50%;
+  height: 100%;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.ff-fall-left {
+  left: 0;
+}
+
+.ff-fall-right {
+  right: 0;
+}
+
+/* The thumb pad, at the bottom left corner. */
+.ff-pad {
+  position: absolute;
+  left: calc(16px + env(safe-area-inset-left));
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  width: 120px;
+  height: 120px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 50%;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.ff-track {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  left: calc(12px + env(safe-area-inset-left));
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 14px;
+  font: 13px system-ui, -apple-system, sans-serif;
+  color: #fff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.ff-track[aria-pressed='true'] {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* The hackey: a dark ball on a short strap, at the right hip. */
+.ff-pull {
+  position: absolute;
+  right: calc(16px + env(safe-area-inset-right));
+  bottom: calc(24px + env(safe-area-inset-bottom));
+  width: 64px;
+  height: 64px;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.ff-pull::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  border-radius: 50%;
+  background: rgba(24, 24, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+.ff-pull::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 20px;
+  margin: -30px 0 0 -1px;
+  background: rgba(255, 255, 255, 0.35);
+}
+
 #attribution {
   position: fixed;
   left: 8px;

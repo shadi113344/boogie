@@ -1,0 +1,164 @@
+import { describe, it, expect } from 'vitest';
+import { ElevationGrid } from '@/world/ElevationGrid';
+import {
+  LocalFrame,
+  lonLatToMercator,
+  lonLatToTile,
+  mercatorToLonLat,
+  metersPerPixel,
+  tileBoundsMercator,
+} from '@/world/geo';
+import { TERRARIUM_TILE_SIZE } from '@/world/terrarium';
+
+const TILE = TERRARIUM_TILE_SIZE;
+const ORIGIN = { lon: 7.88, lat: 46.68 };
+const frame = new LocalFrame(ORIGIN);
+
+/** A tile of one constant height, in metres above sea level. */
+function flatTile(height: number): Float32Array {
+  return new Float32Array(TILE * TILE).fill(height);
+}
+
+/**
+ * A tile whose height grows by 1 m for every pixel row southwards.
+ *
+ * The height is the row's index in the zoom-z pixel grid (y * 256 + row), so
+ * the ramp runs on unbroken from one tile of that zoom to the next.
+ */
+function rampTile(z: number, x: number, y: number): Float32Array {
+  if (y < 0 || y >= 2 ** z) throw new Error(`tile ${z}/${x}/${y} is outside the zoom ${z} grid`);
+  const heights = new Float32Array(TILE * TILE);
+  for (let row = 0; row < TILE; row++) {
+    const h = y * TILE + row;
+    for (let col = 0; col < TILE; col++) heights[row * TILE + col] = h;
+  }
+  return heights;
+}
+
+describe('ElevationGrid', () => {
+  it('returns null with no tiles and 0 from sampleLocal', () => {
+    const g = new ElevationGrid(frame);
+    expect(g.tileCount()).toBe(0);
+    expect(g.sample(ORIGIN)).toBeNull();
+    expect(g.finestLoadedTileFor(ORIGIN)).toBeNull();
+    expect(g.sampleLocal(0, 0)).toBe(0);
+    expect(g.groundY(0, 0)).toBe(0);
+  });
+
+  it('elevationTileFor caps zoom at maxZoom and rescales x,y', () => {
+    const g = new ElevationGrid(frame);
+    expect(g.maxZoom).toBe(14);
+    expect(g.elevationTileFor({ z: 16, x: 34202, y: 23137 })).toEqual({ z: 14, x: 8550, y: 5784 });
+    expect(g.elevationTileFor({ z: 10, x: 534, y: 361 })).toEqual({ z: 10, x: 534, y: 361 });
+  });
+
+  it('elevationTileFor honours a custom maxZoom', () => {
+    const g = new ElevationGrid(frame, { maxZoom: 12 });
+    expect(g.maxZoom).toBe(12);
+    expect(g.elevationTileFor({ z: 16, x: 34202, y: 23137 })).toEqual({ z: 12, x: 2137, y: 1446 });
+    expect(g.elevationTileFor({ z: 12, x: 2137, y: 1445 })).toEqual({ z: 12, x: 2137, y: 1445 });
+  });
+
+  it('samples bilinearly inside a ramp tile', () => {
+    const g = new ElevationGrid(frame);
+    const t = lonLatToTile(ORIGIN, 14);
+    const south = { z: 14, x: t.x, y: t.y + 1 };
+    g.addTile(t, rampTile(14, t.x, t.y));
+    g.addTile(south, rampTile(14, south.x, south.y));
+
+    // A quarter of a tile south, measured in the local frame's metres.
+    const b = tileBoundsMercator(t);
+    const quarter = ((b.maxY - b.minY) / 4) * frame.scale;
+
+    const a = g.sample(ORIGIN);
+    const s = g.sample(frame.toLonLat(0, quarter));
+    expect(a).not.toBeNull();
+    expect(s).not.toBeNull();
+    expect(a?.zoom).toBe(14);
+    expect(s?.zoom).toBe(14);
+    // The ramp climbs 1 m per row, and a quarter tile is 64 rows.
+    expect((s?.height ?? 0) - (a?.height ?? 0)).toBeCloseTo(64, 1);
+  });
+
+  it('interpolates between pixel centres along a column ramp', () => {
+    const g = new ElevationGrid(frame);
+    const t = lonLatToTile(ORIGIN, 14);
+    const heights = new Float32Array(TILE * TILE);
+    for (let row = 0; row < TILE; row++) {
+      for (let col = 0; col < TILE; col++) heights[row * TILE + col] = col;
+    }
+    g.addTile(t, heights);
+
+    const a = g.sampleLocal(0, 0);
+    const b = g.sampleLocal(metersPerPixel(ORIGIN.lat, 14), 0);
+    // One pixel further east is one metre higher on this ramp.
+    expect(b - a).toBeCloseTo(1, 6);
+    // The origin falls between two pixel centres, so the height is fractional.
+    expect(a % 1).not.toBe(0);
+  });
+
+  it('puts the pixel centres at (i + 0.5) / 256', () => {
+    const g = new ElevationGrid(frame);
+    const t = lonLatToTile(ORIGIN, 14);
+    const heights = new Float32Array(TILE * TILE);
+    for (let row = 0; row < TILE; row++) {
+      for (let col = 0; col < TILE; col++) heights[row * TILE + col] = col;
+    }
+    g.addTile(t, heights);
+
+    // The centre of the tile's first column pixel.
+    const b = tileBoundsMercator(t);
+    const m = lonLatToMercator(ORIGIN);
+    const centre = mercatorToLonLat(b.minX + ((b.maxX - b.minX) * 0.5) / TILE, m.y);
+
+    expect(g.sample(centre)?.height).toBeCloseTo(0, 6);
+  });
+
+  it('prefers the finest loaded tile', () => {
+    const g = new ElevationGrid(frame);
+    const t12 = lonLatToTile(ORIGIN, 12);
+    const t14 = lonLatToTile(ORIGIN, 14);
+    g.addTile(t12, flatTile(100));
+    g.addTile(t14, flatTile(200));
+
+    expect(g.tileCount()).toBe(2);
+    expect(g.hasTile(t12)).toBe(true);
+    expect(g.hasTile(t14)).toBe(true);
+    expect(g.finestLoadedTileFor(ORIGIN)).toEqual(t14);
+
+    const s = g.sample(ORIGIN);
+    expect(s?.height).toBe(200);
+    expect(s?.zoom).toBe(14);
+  });
+
+  it('falls back to a coarser loaded tile', () => {
+    const g = new ElevationGrid(frame);
+    const t12 = lonLatToTile(ORIGIN, 12);
+    g.addTile(t12, flatTile(100));
+
+    expect(g.finestLoadedTileFor(ORIGIN)).toEqual(t12);
+    const s = g.sample(ORIGIN);
+    expect(s?.height).toBe(100);
+    expect(s?.zoom).toBe(12);
+  });
+
+  it('keeps negative heights', () => {
+    const g = new ElevationGrid(frame);
+    const t = lonLatToTile(ORIGIN, 14);
+    g.addTile(t, flatTile(-3));
+
+    const s = g.sample(ORIGIN);
+    expect(s?.height).toBe(-3);
+    expect(g.sampleLocal(0, 0)).toBe(-3);
+  });
+
+  it('groundY subtracts curvature', () => {
+    const g = new ElevationGrid(frame);
+    const t = lonLatToTile(frame.toLonLat(10000, 0), 14);
+    g.addTile(t, flatTile(0));
+
+    expect(g.sampleLocal(10000, 0)).toBe(0);
+    expect(g.groundY(10000, 0)).toBeCloseTo(-7.85, 1);
+    expect(g.groundY(0, 0)).toBe(0);
+  });
+});

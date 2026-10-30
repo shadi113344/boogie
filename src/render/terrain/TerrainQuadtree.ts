@@ -232,15 +232,25 @@ export class TerrainQuadtree {
    * A split replaces one leaf with its four children, so the selection
    * always covers the same area: the budget only decides how fine that area
    * is, never where it is.
+   *
+   * A tile is only a candidate when `canRefine` says so: the terrain lets a
+   * tile split once it can draw the tile itself, so every leaf has a parent
+   * that can stand in for it, and the ground sharpens one level at a time.
+   * A tile that cannot be drawn yet stays a leaf, and the coarse tile above
+   * it keeps the ground until it can.
    */
-  select(cam: LodCamera, heightRange: (t: TileCoord) => HeightRange): TileCoord[] {
+  select(
+    cam: LodCamera,
+    heightRange: (t: TileCoord) => HeightRange,
+    canRefine: (t: TileCoord) => boolean = () => true,
+  ): TileCoord[] {
     const leaves = new Map<string, TileCoord>();
     const heap: Candidate[] = [];
 
     for (const root of this.rootTiles()) {
       leaves.set(tileKey(root), root);
       const error = this.splitError(cam, root, heightRange);
-      if (error !== null) heapPush(heap, { tile: root, error });
+      if (error !== null && canRefine(root)) heapPush(heap, { tile: root, error });
     }
 
     while (heap.length > 0 && leaves.size + 3 <= this.config.maxLeaves) {
@@ -249,7 +259,7 @@ export class TerrainQuadtree {
       for (const child of childTiles(candidate.tile)) {
         leaves.set(tileKey(child), child);
         const error = this.splitError(cam, child, heightRange);
-        if (error !== null) heapPush(heap, { tile: child, error });
+        if (error !== null && canRefine(child)) heapPush(heap, { tile: child, error });
       }
     }
 
@@ -325,25 +335,88 @@ export class TerrainQuadtree {
 }
 
 /**
- * The tiles to draw for a desired set: every leaf that is not ready is
- * replaced by the nearest ready ancestor, and duplicates are dropped.
+ * The tiles to draw for a desired set.
+ *
+ * No two drawn tiles ever overlap. The cover of a leaf is:
+ *
+ * - the leaf itself, when it is ready;
+ * - the four tiles it was merged from, when the leaf is not ready but its
+ *   children are: the camera has moved away, the four children have been
+ *   merged back into one parent, and the parent is not built yet, so the
+ *   children keep the ground until it is;
+ * - the four tiles one of the children was merged from, when that child is
+ *   not ready but its own four children are: the same case one level down;
+ * - otherwise its nearest ready ancestor, which covers it and everything
+ *   below it;
+ * - nothing, when nothing covers it.
+ *
+ * A coarse tile that stands in for a leaf hides the finer tiles below it:
+ * the coarse one is drawn instead of them, never on top of them. The
+ * ground is therefore covered by one mesh per place, and a coarse mesh
+ * never floats above the fine ones that cover the same ground.
  */
 export function computeRenderSet(
   desired: TileCoord[],
   isReady: (t: TileCoord) => boolean,
 ): TileCoord[] {
-  const out: TileCoord[] = [];
+  const covers: TileCoord[] = [];
   const seen = new Set<string>();
   for (const leaf of desired) {
-    let t: TileCoord | null = leaf;
-    while (t !== null && !isReady(t)) t = parentTile(t);
-    if (t === null) continue;
-    const key = tileKey(t);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(t);
+    for (const t of coverOf(leaf, isReady)) {
+      const key = tileKey(t);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      covers.push(t);
+    }
   }
-  return out;
+
+  // A tile that has a proper ancestor in the set is drawn by that ancestor:
+  // the two would cover the same ground.
+  const keys = new Set(covers.map(tileKey));
+  return covers.filter((t) => !hasAncestorIn(t, keys));
+}
+
+/**
+ * The tiles that cover a leaf: the leaf itself, the tiles it was merged
+ * from, or the nearest ready ancestor.
+ */
+function coverOf(leaf: TileCoord, isReady: (t: TileCoord) => boolean): TileCoord[] {
+  if (isReady(leaf)) return [leaf];
+
+  // The merge case: the leaf is drawn as the four tiles it was merged from.
+  // One of them may be drawn as the four tiles it was merged from as well,
+  // but no deeper than that: the ground under a leaf is covered by a small
+  // area, never by a far ancestor that floats above the valleys.
+  const merged: TileCoord[] = [];
+  let complete = true;
+  for (const child of childTiles(leaf)) {
+    if (isReady(child)) {
+      merged.push(child);
+      continue;
+    }
+    const grandchildren = childTiles(child);
+    if (!grandchildren.every((g) => isReady(g))) {
+      complete = false;
+      break;
+    }
+    merged.push(...grandchildren);
+  }
+  if (complete) return merged;
+
+  // Otherwise the nearest ready ancestor stands in for the leaf.
+  let ancestor = parentTile(leaf);
+  while (ancestor !== null && !isReady(ancestor)) ancestor = parentTile(ancestor);
+  return ancestor === null ? [] : [ancestor];
+}
+
+/** Whether a tile has a proper ancestor among a set of tiles. */
+function hasAncestorIn(t: TileCoord, keys: Set<string>): boolean {
+  let ancestor = parentTile(t);
+  while (ancestor !== null) {
+    if (keys.has(tileKey(ancestor))) return true;
+    ancestor = parentTile(ancestor);
+  }
+  return false;
 }
 
 /** Distance from a value to an interval, zero inside it. */

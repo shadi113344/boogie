@@ -5,13 +5,17 @@
  * elevation and imagery, drapes the meshes over the heights, keeps the ground
  * free of holes and throws the rest away again.
  *
- * Three rules keep the ground on screen:
+ * Four rules keep the ground on screen:
  *
- * - a tile is only drawn once its imagery has arrived, and a leaf that is not
- *   ready falls back to its nearest ready ancestor, so a slow or missing tile
- *   leaves the parent's texture on screen instead of a hole;
- * - the imagery of the parent is asked for as well, so the fallback is
- *   already there when the fine tile is still on its way;
+ * - a tile only splits once it can be drawn itself, so the ground sharpens
+ *   one level at a time and every tile that is split has a parent that can
+ *   stand in for it;
+ * - a leaf that is not ready is covered by its parent, or by the tiles it
+ *   was merged from when the parent is not built yet, and nothing finer than
+ *   that cover is drawn under it: two drawn tiles never overlap, so a coarse
+ *   mesh never floats above the fine ones that cover the same ground;
+ * - only the visible tiles render: a mesh that is built but not on screen
+ *   draws nothing;
  * - the textures belong to the tile cache: a disposed mesh gives its texture
  *   back, and the cache gives the GPU texture back when it evicts the bitmap.
  */
@@ -152,11 +156,18 @@ export class Terrain {
 
   private desiredTiles: TileCoord[] = [];
 
+  /**
+   * The tiles that were split on the last update: every proper ancestor of
+   * a leaf of the selection, down to the root zoom.
+   *
+   * A tile that was split stays split while the selection keeps it split, so
+   * a parent whose mesh or texture was thrown away after its children took
+   * over is not merged back and split again in a loop.
+   */
+  private interior = new Set<string>();
+
   /** The camera of the last update: the priority of the requests and the order of the builds. */
   private lastCam: LodCamera | null = null;
-
-  /** True while nothing is known about the ground and only the root ring is wanted. */
-  private rootRingOnly = false;
 
   /** The distance from the camera to every desired tile, by tile key. */
   private readonly distances = new Map<string, number>();
@@ -218,13 +229,16 @@ export class Terrain {
     this.lastCam = cam;
     this.buildsSinceUpdate = 0;
 
-    // Before any elevation has arrived nothing can be placed, so only the root
-    // ring is wanted: its elevation tiles are the few that every later
-    // selection needs first, and the near field is not refined blind.
-    this.rootRingOnly = this.elevation.tileCount() === 0;
-    this.desiredTiles = this.rootRingOnly
-      ? this.quadtree.rootTiles()
-      : this.quadtree.select(cam, (t) => this.heightRange(t));
+    // The selection only refines what it can draw: a tile that is not ready
+    // yet stays a leaf, and the coarse tile above it keeps the ground. The
+    // tiles that were split on the last update stay split, so the selection
+    // does not oscillate between two levels.
+    this.desiredTiles = this.quadtree.select(
+      cam,
+      (t) => this.heightRange(t),
+      (t) => this.canRefine(t),
+    );
+    this.updateInterior();
 
     // The distance to every desired tile: the priority of the requests and
     // the order of the builds.
@@ -239,6 +253,39 @@ export class Terrain {
 
     this.requestMissing(cam, now);
     this.refreshVisible(now);
+  }
+
+  /**
+   * The tiles that were split on the last update.
+   *
+   * Every proper ancestor of a leaf of the selection is a tile that was
+   * split: it was replaced by its children, and the ground it used to cover
+   * is now covered by them.
+   */
+  private updateInterior(): void {
+    const interior = new Set<string>();
+    const rootZoom = this.quadtree.config.rootZoom;
+    for (const leaf of this.desiredTiles) {
+      let ancestor = parentTile(leaf);
+      while (ancestor && ancestor.z >= rootZoom) {
+        interior.add(tileKey(ancestor));
+        ancestor = parentTile(ancestor);
+      }
+    }
+    this.interior = interior;
+  }
+
+  /**
+   * Whether a tile may be split.
+   *
+   * A tile is split once its own imagery and the elevation it is draped on
+   * have arrived, so its children have it to fall back on. A tile that was
+   * already split on the last update stays split while the selection keeps
+   * it split, so a parent whose mesh or texture was thrown away after its
+   * children took over is not merged back and split again in a loop.
+   */
+  private canRefine(t: TileCoord): boolean {
+    return this.interior.has(tileKey(t)) || (this.isReady(t) && this.elevationReady(t));
   }
 
   /**
@@ -309,27 +356,22 @@ export class Terrain {
   }
 
   /**
-   * Ask for what is missing: the elevation of every desired tile and, once
-   * the ground under a tile is known, its imagery.
+   * Ask for what is missing: the elevation of every desired tile and its
+   * imagery.
    *
-   * The imagery of a tile whose ground is not known yet is not asked for:
-   * without the heights there is nothing to drape the tile on, and the
-   * selection is about to change anyway. The elevation tiles are coarse and
-   * few, so the ground is known one round trip later and the imagery can
-   * follow. The fallback of such a tile does not wait: the fallback is
-   * exactly what covers the ground while the tile itself is on its way.
+   * The two are asked for at once. A desired tile is only ever the next
+   * level under ground that is already drawn, so its heights and its
+   * imagery are both needed now, and asking for both at once costs one
+   * round trip per level instead of two.
    *
-   * "Known" means the elevation tile the imagery is draped on, not just any
-   * elevation tile that covers it: a coarse tile says nothing about how fine
-   * the selection is going to be, and the imagery of a zoom that is about to
-   * change is imagery thrown away.
+   * The fallback of a leaf is asked for as well, so a leaf that is not ready
+   * has something to stand in for it while its own imagery is on its way.
    */
   private requestMissing(cam: LodCamera, now: number): void {
     const nearest = this.nearestFirst();
 
     for (const coord of nearest) {
       this.requestElevation(coord, cam, now);
-      if (!this.elevationReady(coord)) continue;
       this.requestImagery(coord, cam, now);
     }
 
@@ -358,6 +400,11 @@ export class Terrain {
   /**
    * Work out what is on screen and build the meshes of those tiles.
    *
+   * The meshes to build are the ready leaves of the selection and the tiles
+   * that stand in for the leaves that are not ready. The ready leaves come
+   * first: they are the ones that take over from their parent, and they are
+   * built together so that all four of them are on screen in the same frame.
+   *
    * A leaf that has no imagery falls back to the nearest ancestor that has,
    * so the ground is never missing: a tile that is slow or that has failed
    * leaves its parent's texture on screen.
@@ -366,6 +413,9 @@ export class Terrain {
    * so a hundred tiles that arrive together do not stall a frame. A tile
    * whose mesh is not built yet falls back to its nearest ancestor that has
    * one, exactly as a tile that has not arrived at all does.
+   *
+   * Only the visible tiles are drawn: a mesh that is built but is not on
+   * screen stays in the world, ready to come back, and draws nothing.
    */
   private refreshVisible(now: number): void {
     this.visibleTiles.length = 0;
@@ -373,13 +423,31 @@ export class Terrain {
     // The tiles that have imagery: the ones that can have a mesh.
     const ready = computeRenderSet(this.desiredTiles, (t) => this.isReady(t));
 
-    // The meshes that are missing, nearest to the camera first.
-    const missing = ready
-      .filter((coord) => !this.hasMesh(coord))
-      .sort((a, b) => this.distanceOf(a) - this.distanceOf(b));
+    // The meshes that are missing: the ready leaves first, so that they can
+    // take over from their parent in one go, then the tiles that stand in
+    // for the leaves that are not ready.
+    const missing: TileCoord[] = [];
+    const seen = new Set<string>();
+    const add = (coord: TileCoord): void => {
+      const key = tileKey(coord);
+      if (seen.has(key)) return;
+      seen.add(key);
+      missing.push(coord);
+    };
+    for (const coord of this.desiredTiles) {
+      if (!this.isReady(coord)) continue;
+      if (this.hasMesh(coord)) continue;
+      add(coord);
+    }
+    for (const coord of ready) {
+      if (this.hasMesh(coord)) continue;
+      add(coord);
+    }
 
     const budget = Math.max(0, this.options.maxBuildsPerUpdate - this.buildsSinceUpdate);
-    for (const coord of missing.slice(0, budget)) {
+    for (const coord of missing
+      .sort((a, b) => this.distanceOf(a) - this.distanceOf(b))
+      .slice(0, budget)) {
       this.ensureMesh(coord, now);
       this.buildsSinceUpdate++;
     }
@@ -388,6 +456,14 @@ export class Terrain {
     // fall back to their nearest ancestor that has one.
     for (const coord of computeRenderSet(this.desiredTiles, (t) => this.hasMesh(t))) {
       this.visibleTiles.push(coord);
+    }
+
+    // Only the visible tiles draw. A mesh that is out of view stays in the
+    // world, so a camera that turns back finds it still there.
+    const visible = new Set(this.visibleTiles.map(tileKey));
+    for (const [key, state] of this.tiles) {
+      if (!state.tile) continue;
+      state.tile.mesh.visible = visible.has(key);
     }
 
     this.enforceBudget(now);
@@ -720,16 +796,10 @@ export class Terrain {
       state.tile.rebuildHeights(this.heightAt, coord.z);
     }
 
-    // The ground is known now, so the imagery of the tiles it covers can be
-    // asked for: they were held back while the heights were missing.
+    // The ground is known now, so the tiles it covers can be asked for: the
+    // selection may refine now that it can draw the tiles it splits.
     const cam = this.lastCam;
     if (!cam) return;
-    if (this.rootRingOnly) {
-      // The first ground has arrived: select properly now rather than on the
-      // next frame, so a cold start loses no time.
-      this.update(cam);
-      return;
-    }
     this.requestMissing(cam, Date.now());
   }
 
@@ -766,6 +836,9 @@ export class Terrain {
     );
     tile.setTexture(texture);
     tile.textureZoom = coord.z;
+
+    // A new mesh draws nothing until the selection says it is on screen.
+    tile.mesh.visible = false;
 
     this.world.add(tile.mesh);
     state.tile = tile;

@@ -4,7 +4,7 @@ import { LocalFrame, lonLatToTile, metersPerPixel, parentTile, tileKey } from '@
 import type { TileCoord } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
 import { TileCache, TileFetchError } from '@/world/TileCache';
-import { imageryProviderForZoom, tileUrl } from '@/world/providers';
+import { ELEVATION_PROVIDER, imageryProviderForZoom, tileUrl } from '@/world/providers';
 import type { Atmosphere } from '@/render/Atmosphere';
 import { Terrain } from '@/render/terrain/Terrain';
 import { TerrainTile } from '@/render/terrain/TerrainTile';
@@ -47,6 +47,14 @@ function elevationTileOf(url: string): TileCoord | null {
   const match = url.match(/\/terrarium\/(\d+)\/(\d+)\/(\d+)\.png/);
   if (!match) return null;
   return { z: Number(match[1]), x: Number(match[2]), y: Number(match[3]) };
+}
+
+/** The tile of an imagery URL, or null when the URL is not one. */
+function imageryTileOf(url: string): TileCoord | null {
+  const match = url.match(/\/(?:tile|g)\/(\d+)\/(\d+)\/(\d+)(?:\.jpg)?$/);
+  if (!match) return null;
+  // Both imagery providers put the row before the column.
+  return { z: Number(match[1]), y: Number(match[2]), x: Number(match[3]) };
 }
 
 /** Whether two tiles are the same one. */
@@ -147,6 +155,13 @@ function makeCache(
      * asked for: the network is slow and the tiles arrive one by one.
      */
     elevationInOrder?: boolean;
+    /**
+     * The imagery of the tiles the predicate picks arrives late, by this
+     * many milliseconds: the network is slow for some of them.
+     */
+    lateImageMs?: number;
+    /** The tiles whose imagery arrives late. */
+    lateImage?: (t: TileCoord) => boolean;
   } = {},
 ): CacheFixture {
   const fetched: string[] = [];
@@ -181,6 +196,13 @@ function makeCache(
     if (opts.hangImageZoom !== undefined && zoomOf(url) === opts.hangImageZoom) {
       // Never arrives: the tile stays without imagery.
       await new Promise<never>(() => {});
+    }
+    if (opts.lateImageMs !== undefined && opts.lateImage) {
+      const tile = imageryTileOf(url);
+      if (tile && opts.lateImage(tile)) {
+        // Arrives late: the ground is coarse for a little while.
+        await new Promise<void>((resolve) => setTimeout(resolve, opts.lateImageMs));
+      }
     }
     return { width: TILE_SIZE, height: TILE_SIZE } as ImageBitmap;
   };
@@ -231,8 +253,8 @@ function makeCache(
 }
 
 /** Let the requests run to the end. The ones that hang never do. */
-async function settle(cache: TileCache): Promise<void> {
-  for (let i = 0; i < 40; i++) {
+async function settle(cache: TileCache, ticks = 40): Promise<void> {
+  for (let i = 0; i < ticks; i++) {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const stats = cache.stats();
     if (stats.pending === 0 && stats.inFlight === 0) return;
@@ -245,11 +267,29 @@ interface Fixture extends CacheFixture {
   elevation: ElevationGrid;
 }
 
+/**
+ * Update and let the requests run, again and again.
+ *
+ * The terrain refines top down: a tile is only split once it can be drawn
+ * itself, so the selection needs one round trip per zoom level. A test that
+ * expects a settled, deep selection has to stream, not update once.
+ *
+ * The wait between the updates is short: a tile that is on its way arrives
+ * within a few ticks, and the requests that hang never arrive anyway.
+ */
+async function stream(fixture: Fixture, cam: LodCamera, updates = 40): Promise<void> {
+  for (let step = 0; step < updates; step++) {
+    fixture.terrain.update(cam);
+    await settle(fixture.cache, 4);
+  }
+}
+
 /** A terrain over a fake world, streaming into the given cache. */
 function makeTerrain(
   cacheFixture: CacheFixture,
   opts: {
     maxVisibleTiles?: number;
+    maxTextures?: number;
     maxBuildsPerUpdate?: number;
     disposeDelayMs?: number;
     elevationMaxTiles?: number;
@@ -260,6 +300,7 @@ function makeTerrain(
   const elevation = new ElevationGrid(frame, { maxTiles: opts.elevationMaxTiles });
   const terrain = new Terrain(world, frame, lz, elevation, cacheFixture.cache, atmo, {
     maxVisibleTiles: opts.maxVisibleTiles ?? 60,
+    maxTextures: opts.maxTextures,
     maxBuildsPerUpdate: opts.maxBuildsPerUpdate,
     disposeDelayMs: opts.disposeDelayMs,
     tau: opts.tau,
@@ -299,25 +340,21 @@ describe('Terrain', () => {
   });
 
   it('shows a parent until the children are ready', async () => {
-    const fixture = makeTerrain(makeCache({ hangImageZoom: 16 }), { maxVisibleTiles: 400 });
+    const fixture = makeTerrain(makeCache({ hangImageZoom: 15 }), { maxVisibleTiles: 400 });
 
-    // The first pass asks for everything: the ground is not known yet.
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
-
-    // The ground is known now, and the selection settles on it.
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
+    // The selection refines top down, so it takes a round trip per level to
+    // get to the fine tiles.
+    await stream(fixture, cameraAt(0, 4683, 0));
 
     // The fine tiles were asked for, and never arrived.
     expect(
-      fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16),
+      fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 15),
     ).toBe(true);
 
     // What is on screen is coarser, and there is something on screen.
     const visible = fixture.terrain.visibleTiles;
     expect(visible.length).toBeGreaterThan(0);
-    expect(Math.max(...visible.map((tile) => tile.z))).toBeLessThanOrEqual(15);
+    expect(Math.max(...visible.map((tile) => tile.z))).toBeLessThanOrEqual(14);
   });
 
   it('rebuilds heights when a finer elevation tile arrives', async () => {
@@ -331,12 +368,19 @@ describe('Terrain', () => {
       maxBuildsPerUpdate: 200,
     });
 
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
+    // The selection refines top down, and the zoom-12 elevation is the one
+    // the zoom-14 tiles are draped on.
+    await stream(fixture, cameraAt(0, 4683, 0));
 
     // The coarse elevation has arrived, the fine one is still held.
     expect(fixture.fetched.some((url) => isElevation(url) && zoomOf(url) === 5)).toBe(true);
     expect(fixture.fetched.some((url) => isElevation(url) && zoomOf(url) === 12)).toBe(true);
+
+    // The selection refines top down, and a tile is only split once the
+    // elevation it is draped on has arrived: the zoom-14 tiles are draped on
+    // the zoom-12 elevation, so the selection stops there.
+    const leaves = fixture.terrain['desiredTiles'];
+    expect(Math.max(...leaves.map((tile: TileCoord) => tile.z))).toBe(14);
 
     // And now the fine one comes.
     fixture.releaseElevation();
@@ -396,22 +440,26 @@ describe('Terrain', () => {
     expect(highest).toBeCloseTo(568, 0);
   });
 
-  it('asks for no imagery until the ground is known', async () => {
+  it('asks for the root ring\'s imagery and elevation together on a cold start', async () => {
     const fixture = makeTerrain(makeCache({ holdElevationAbove: 0 }));
 
-    // The ground is not known, so only the elevation is asked for: there is
-    // nothing to drape the imagery on yet.
+    // Nothing is known about the ground yet: the selection is the root ring,
+    // and the imagery of the ring and the elevation it is draped on are
+    // asked for together.
     fixture.terrain.update(cameraAt(0, 4683, 0));
     await settle(fixture.cache);
 
+    const imagery = new Set<string>();
+    const elevation = new Set<string>();
+    for (const root of fixture.terrain.quadtree.rootTiles()) {
+      imagery.add(tileUrl(imageryProviderForZoom(root.z), root));
+      elevation.add(tileUrl(ELEVATION_PROVIDER, fixture.elevation.elevationTileFor(root)));
+    }
+
     expect(fixture.fetched.length).toBeGreaterThan(0);
-    expect(fixture.fetched.every((url) => isElevation(url))).toBe(true);
-
-    // The ground arrives, and the imagery follows it.
-    fixture.releaseElevation();
-    await settle(fixture.cache);
-
-    expect(fixture.fetched.some((url) => !isElevation(url))).toBe(true);
+    expect(fixture.fetched.every((url) => imagery.has(url) || elevation.has(url))).toBe(true);
+    expect(fixture.fetched.some((url) => imagery.has(url))).toBe(true);
+    expect(fixture.fetched.some((url) => elevation.has(url))).toBe(true);
   });
 
   it('builds at most maxBuildsPerUpdate meshes per update and keeps the ground covered', async () => {
@@ -449,7 +497,7 @@ describe('Terrain', () => {
     // an ancestor among the drawn tiles.
     const drawn = new Set(fixture.terrain.visibleTiles.map(tileKey));
     expect(drawn.size).toBeGreaterThan(0);
-    for (const leaf of fixture.terrain.quadtree.select(near, (t) => fixture.terrain.heightRange(t))) {
+    for (const leaf of fixture.terrain['desiredTiles'] as TileCoord[]) {
       expect(coveredBy(drawn, leaf)).toBe(true);
     }
 
@@ -460,11 +508,9 @@ describe('Terrain', () => {
       expect(meshed.has(`tile ${tileKey(drawnTile)}`)).toBe(true);
     }
 
-    // Five updates later every tile of the selection has a mesh of its own:
-    // the drawn tiles are then the leaves themselves.
-    for (let step = 0; step < 5; step++) {
-      fixture.terrain.update(near);
-    }
+    // Once the selection has settled, every tile of it has a mesh of its
+    // own: the drawn tiles are then the leaves themselves.
+    await stream(fixture, near);
     const leaves = fixture.terrain.quadtree.select(near, (t) => fixture.terrain.heightRange(t));
     expect(leaves.length).toBe(39);
     expect(fixture.terrain.visibleTiles.length).toBe(39);
@@ -559,34 +605,6 @@ describe('Terrain', () => {
     dispose.mockRestore();
   });
 
-  it('asks for no imagery until the elevation it is draped on has arrived', async () => {
-    // The elevation is two zooms coarser than the imagery, so the fine
-    // tiles are draped on the zoom-12 elevation, which is held back here.
-    const fixture = makeTerrain(makeCache({ holdElevationZoom: 12 }), { maxVisibleTiles: 400 });
-
-    // From high above the drop zone the selection is the root ring, and the
-    // elevation of that ring is coarse but enough to know the ground.
-    fixture.terrain.update(cameraAt(0, 700_000, 0));
-    await settle(fixture.cache);
-
-    // The camera comes down: the selection refines to the fine tiles, but the
-    // elevation they are draped on is still on its way, so the imagery of
-    // that zoom is not asked for.
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
-
-    const leaves = fixture.terrain['desiredTiles'];
-    const fine = Math.max(...leaves.map((tile: TileCoord) => tile.z));
-    expect(fine).toBeGreaterThanOrEqual(14);
-    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === fine)).toBe(false);
-
-    // The fine elevation arrives, and the imagery follows it.
-    fixture.releaseElevation();
-    await settle(fixture.cache);
-
-    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === fine)).toBe(true);
-  });
-
   it("requests the root ring's imagery while only the root elevation is loaded", async () => {
     // The root ring is at zoom 7, and its elevation is two zooms coarser:
     // everything finer than zoom 5 is held back.
@@ -614,12 +632,19 @@ describe('Terrain', () => {
   it('fills in finer fallbacks as finer elevation arrives', async () => {
     const fixture = makeTerrain(makeCache({ holdElevationAbove: 8 }), { maxVisibleTiles: 400 });
 
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
+    // The elevation finer than zoom 8 is held back: a tile is only split
+    // once the elevation it is draped on has arrived, and the zoom-12 tiles
+    // are draped on the zoom-10 elevation.
+    await stream(fixture, cameraAt(0, 4683, 0));
 
-    const root = lonLatToTile(frame.origin, 8);
-    const rootUrl = tileUrl(imageryProviderForZoom(root.z), root);
-    expect(fixture.fetched).toContain(rootUrl);
+    const leaves = fixture.terrain['desiredTiles'] as TileCoord[];
+    const deep = Math.max(...leaves.map((tile) => tile.z));
+    expect(deep).toBeLessThanOrEqual(11);
+
+    // The fallback of the fine tiles is asked for: the parent of the fine
+    // leaves covers the ground while their own imagery is on its way.
+    const imagery = fixture.fetched.filter((url) => !isElevation(url));
+    expect(imagery.some((url) => zoomOf(url) === 10 || zoomOf(url) === 11)).toBe(true);
 
     // The fine elevation arrives.
     fixture.releaseElevation();
@@ -627,24 +652,27 @@ describe('Terrain', () => {
 
     // The camera looks at the ground again, and the selection settles on the
     // fine tiles.
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
+    await stream(fixture, cameraAt(0, 4683, 0));
 
-    // The fallback of the fine tiles is asked for now that the ground under
-    // it is known: the parent of the fine leaves covers the ground while
-    // their own imagery is on its way.
-    const imagery = fixture.fetched.filter((url) => !isElevation(url));
-    expect(imagery.some((url) => zoomOf(url) === 15 || zoomOf(url) === 16)).toBe(true);
-    expect(imagery.some((url) => zoomOf(url) === 15)).toBe(true);
+    const deeper = Math.max(
+      ...(fixture.terrain['desiredTiles'] as TileCoord[]).map((tile) => tile.z),
+    );
+    expect(deeper).toBeGreaterThan(deep);
 
     // The root ring is loaded already: it was asked for before the fine
     // elevation arrived, and it is on screen.
+    const root = lonLatToTile(frame.origin, 8);
+    const rootUrl = tileUrl(imageryProviderForZoom(root.z), root);
     expect(fixture.terrain['textures'].has(rootUrl)).toBe(true);
   });
 
   it('cancels the imagery it no longer wants', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const fixture = makeTerrain(makeCache({ concurrency: 1, hangImageFetch: true }));
+    // The imagery of the zoom-8 tiles never arrives, so the selection
+    // settles on them and the queue fills up with the ones behind them.
+    const fixture = makeTerrain(makeCache({ concurrency: 1, hangImageZoom: 8 }), {
+      maxVisibleTiles: 400,
+    });
 
     // The requests that the cache dropped, and the ones it never sent.
     const cancelled = new Set<string>();
@@ -658,11 +686,11 @@ describe('Terrain', () => {
     };
 
     // The camera looks at the ground: the imagery of the leaves is asked for.
-    fixture.terrain.update(cameraAt(0, 4683, 0));
-    await settle(fixture.cache);
+    await stream(fixture, cameraAt(0, 4683, 0), 20);
 
-    // The camera moves twenty kilometres east: the leaves are other tiles now.
-    fixture.terrain.update(cameraAt(20_000, 4683, 0));
+    // The camera moves two hundred kilometres east, out of the tile it was
+    // looking at: the leaves are other tiles now.
+    fixture.terrain.update(cameraAt(200_000, 4683, 0));
     await settle(fixture.cache);
 
     // The imagery of the first set was dropped before it was ever sent.
@@ -843,9 +871,102 @@ describe('Terrain', () => {
 
     const roots = fixture.terrain.quadtree.rootTiles().length;
     expect(fixture.terrain.stats().desired).toBe(roots);
-    const pending = fixture.terrain['pending'] as Map<string, string>;
-    expect(pending.size).toBeLessThanOrEqual(roots);
-    expect([...pending.values()].every((kind) => kind === 'heights')).toBe(true);
-    expect(fixture.fetched.every(isElevation)).toBe(true);
+
+    // Every URL that was fetched belongs to a root tile: its imagery, or the
+    // elevation it is draped on.
+    const imagery = new Set<string>();
+    const elevation = new Set<string>();
+    for (const root of fixture.terrain.quadtree.rootTiles()) {
+      imagery.add(tileUrl(imageryProviderForZoom(root.z), root));
+      elevation.add(tileUrl(ELEVATION_PROVIDER, fixture.elevation.elevationTileFor(root)));
+    }
+    expect(fixture.fetched.length).toBeGreaterThan(0);
+    expect(fixture.fetched.every((url) => imagery.has(url) || elevation.has(url))).toBe(true);
+  });
+
+  it('never renders a tile over one of its ancestors while it streams', async () => {
+    // Half of the imagery arrives late: the ground is coarse for a while and
+    // the fine tiles come in behind the coarse ones.
+    const fixture = makeTerrain(
+      makeCache({ lateImageMs: 5, lateImage: (t) => t.y % 2 === 1 }),
+      // The budget of the selection has to leave room for the ground to
+      // sharpen to the zoom the test looks for.
+      { maxVisibleTiles: 200, maxBuildsPerUpdate: 1000 },
+    );
+
+    // Sixty degrees down from exit altitude.
+    const cam: LodCamera = {
+      x: 0,
+      y: 568 + 4115,
+      z: 0,
+      focalPx: 1462,
+      dir: { x: 0, y: -0.866, z: -0.5 },
+      halfAngleRad: 0.6,
+    };
+
+    for (let step = 0; step < 150; step++) {
+      fixture.terrain.update(cam);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      const visible = fixture.terrain.visibleTiles;
+      const drawn = new Set(visible.map(tileKey));
+
+      // No tile is drawn together with one of its ancestors.
+      for (const tile of visible) {
+        let ancestor = parentTile(tile);
+        while (ancestor !== null) {
+          expect(drawn.has(tileKey(ancestor))).toBe(false);
+          ancestor = parentTile(ancestor);
+        }
+      }
+
+      // And only the visible tiles draw.
+      const drawnMeshes = fixture.world.children.filter((child) => child.visible).length;
+      expect(drawnMeshes).toBe(visible.length);
+    }
+
+    // The ground has sharpened all the way.
+    expect(Math.max(...fixture.terrain.visibleTiles.map((t) => t.z))).toBeGreaterThanOrEqual(14);
+  });
+
+  it('never selects below a tile it cannot draw', async () => {
+    // The imagery of the zoom-10 tiles never arrives, so they are never
+    // split: the selection cannot go below them.
+    const fixture = makeTerrain(makeCache({ hangImageZoom: 10 }), { maxVisibleTiles: 400 });
+
+    await stream(fixture, cameraAt(0, 4683, 0));
+
+    const desired = fixture.terrain['desiredTiles'] as TileCoord[];
+    expect(Math.max(...desired.map((tile) => tile.z))).toBe(10);
+    expect(Math.max(...fixture.terrain.visibleTiles.map((tile) => tile.z))).toBe(9);
+  });
+
+  it('keeps a split tile split after its texture is thrown away', async () => {
+    // The texture budget is small enough that the textures of the tiles
+    // that stand in for the leaves are thrown away.
+    const fixture = makeTerrain(makeCache(), {
+      maxVisibleTiles: 60,
+      maxTextures: 70,
+      disposeDelayMs: 0,
+    });
+
+    const cam = cameraAt(0, 4683, 0);
+    await stream(fixture, cam);
+
+    const before = (fixture.terrain['desiredTiles'] as TileCoord[]).map(tileKey).sort();
+    expect(before.length).toBeGreaterThan(0);
+    // The selection has settled deep: the ground is sharp.
+    expect(
+      Math.max(...(fixture.terrain['desiredTiles'] as TileCoord[]).map((t) => t.z)),
+    ).toBeGreaterThanOrEqual(13);
+
+    // Five more rounds do not change the selection: a parent whose texture
+    // was thrown away is not merged back into its parent and split again.
+    for (let step = 0; step < 5; step++) {
+      fixture.terrain.update(cam);
+      await settle(fixture.cache);
+      const now = (fixture.terrain['desiredTiles'] as TileCoord[]).map(tileKey).sort();
+      expect(now).toEqual(before);
+    }
   });
 });

@@ -667,3 +667,14 @@ What changed, all in one MiniMax run reviewed and landed as Task 13:
 - The exit pose is placed once a zoom-10 ground sample under the landing area exists and placed again for finer samples, never after the user has moved the camera.
 
 Not verified on a device: frame rate and load time on the phones. The desktop app's browser pane does not run `requestAnimationFrame` while the Claude window is covered, so it produced no timings this time; the numbers above come from the selection code, not from hardware.
+
+## Task 14: never draw coarse ground over fine ground (2026-10-30, after the iPhone screenshots)
+
+The phone screenshots showed a blurry "sea" hanging over the valleys with ridges poking through, a dark band across a slope and a pale triangle on a lake while the terrain streamed. Two causes, both measured with the real `Terrain` over a fake cache:
+
+- Nothing ever set `mesh.visible`, so a mesh that left the visible set kept rendering until it was disposed two seconds later: 59 of 60 simulated frames rendered meshes outside `visibleTiles`, up to 71 at once.
+- `computeRenderSet` drew a ready child together with the parent standing in for its unready sibling: up to 174 tile-over-ancestor pairs in one frame.
+
+The fix, one MiniMax run reviewed and landed as Task 14: only the visible meshes render; the render set never overlaps (a leaf that is not ready is covered by its parent, or for two levels by the tiles it was merged from, and anything finer under a drawn tile is dropped); and the selection refines top-down, splitting a tile only once its own imagery and elevation are in, with split tiles kept split through an interior set so they do not oscillate when their own texture is evicted.
+
+Simulated cold load at the latencies measured from Egypt (elevation 530 ms, imagery 175 ms, 8 in flight): first ground 1.3 s → 0.2 s, tile under the camera at its final zoom 5.7 s → 4.2 s, the same ~188 requests, frames drawing coarse over fine 135 of 541 → 0 of 542. In the browser pane on a cold cache, looking across Lake Brienz from 2,200 m: coherent coarse picture at 1 s, sharp at about 2 s, settled at 5.3 s; then a 9 s descent at 55 m/s while circling: 0 of 270 sampled frames with an overlap or a stray mesh, at 60 fps.

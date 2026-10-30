@@ -1,0 +1,569 @@
+/**
+ * Terrain streaming: the requests, the tile lifecycle and the budgets.
+ *
+ * The quadtree says which tiles the camera wants. This class fetches their
+ * elevation and imagery, drapes the meshes over the heights, keeps the ground
+ * free of holes and throws the rest away again.
+ *
+ * Three rules keep the ground on screen:
+ *
+ * - a tile is only drawn once its imagery has arrived, and a leaf that is not
+ *   ready falls back to its nearest ready ancestor, so a slow or missing tile
+ *   leaves the parent's texture on screen instead of a hole;
+ * - the imagery of the parent is asked for as well, so the fallback is
+ *   already there when the fine tile is still on its way;
+ * - the textures belong to the tile cache: a disposed mesh gives its texture
+ *   back, and the cache gives the GPU texture back when it evicts the bitmap.
+ */
+
+import * as THREE from 'three';
+import { parentTile, tileKey } from '../../world/geo';
+import type { LocalFrame, TileCoord } from '../../world/geo';
+import type { ElevationGrid } from '../../world/ElevationGrid';
+import type { TileCache } from '../../world/TileCache';
+import { ELEVATION_PROVIDER, imageryProviderForZoom, tileUrl } from '../../world/providers';
+import type { Atmosphere } from '../Atmosphere';
+import { TerrainTile } from './TerrainTile';
+import type { TileBounds } from './TerrainTile';
+import { TerrainQuadtree, computeRenderSet } from './TerrainQuadtree';
+import type { HeightRange, LodCamera } from './TerrainQuadtree';
+
+/** How the terrain is allowed to look. Every field has a default. */
+export interface TerrainOptions {
+  /** Texels per screen pixel allowed before a tile is split. */
+  tau?: number;
+  /** Anisotropic filtering on the imagery. */
+  anisotropy?: number;
+  /** Imagery textures kept on the GPU at once. */
+  maxTextures?: number;
+  /** Tiles the terrain shows, and the budget of the selection that feeds it. */
+  maxVisibleTiles?: number;
+  /** How long a tile may stay out of view before its mesh is disposed. */
+  disposeDelayMs?: number;
+}
+
+/**
+ * The high tier's numbers. Task 11 owns the tiers and passes their own.
+ */
+export const DEFAULT_TERRAIN_OPTIONS: Required<TerrainOptions> = {
+  tau: 1.0,
+  anisotropy: 8,
+  maxTextures: 512,
+  maxVisibleTiles: 400,
+  disposeDelayMs: 2000,
+};
+
+/** The height range used while no elevation has arrived, in metres. */
+const UNKNOWN_RANGE: HeightRange = { min: 0, max: 5000 };
+
+/** How long a failed tile is left alone before it is asked for again, in ms. */
+const RETRY_AFTER_MS = 30_000;
+
+/** The state of one terrain tile. */
+interface TileState {
+  coord: TileCoord;
+
+  bounds: TileBounds;
+
+  /** The URL of the imagery on the tile. */
+  imageryUrl: string;
+
+  /** The mesh, once the tile has been drawn at least once. */
+  tile: TerrainTile | null;
+
+  /** When the tile was last in the visible set. */
+  lastVisibleAt: number;
+}
+
+export class Terrain {
+  /** The selection of tiles; its tau is what `setTau` changes. */
+  readonly quadtree: TerrainQuadtree;
+
+  /** The tiles that are on screen after the fallbacks are worked out. */
+  readonly visibleTiles: TileCoord[] = [];
+
+  private readonly world: THREE.Group;
+
+  private readonly frame: LocalFrame;
+
+  private readonly elevation: ElevationGrid;
+
+  private readonly cache: TileCache;
+
+  private readonly atmo: Atmosphere;
+
+  private readonly options: Required<TerrainOptions>;
+
+  /** The height of the ground at a point, curvature included. */
+  private readonly heightAt: (x: number, z: number) => number;
+
+  /** Every tile the terrain knows about, by tile key. */
+  private readonly tiles = new Map<string, TileState>();
+
+  /** The requests on their way, by URL. */
+  private readonly pending = new Map<string, 'image' | 'heights'>();
+
+  /** The URLs that failed, and when they failed. */
+  private readonly failed = new Map<string, number>();
+
+  /** The height range of every elevation tile that has arrived, by tile key. */
+  private readonly elevationRanges = new Map<string, HeightRange>();
+
+  /** The imagery textures, by URL. */
+  private readonly textures = new Map<string, THREE.Texture>();
+
+  /** When each texture was last used, oldest first: the eviction order. */
+  private readonly textureOrder = new Map<string, number>();
+
+  private desiredTiles: TileCoord[] = [];
+
+  constructor(
+    world: THREE.Group,
+    frame: LocalFrame,
+    lz: { x: number; z: number },
+    elevation: ElevationGrid,
+    cache: TileCache,
+    atmo: Atmosphere,
+    opts: TerrainOptions = {},
+  ) {
+    this.world = world;
+    this.frame = frame;
+    this.elevation = elevation;
+    this.cache = cache;
+    this.atmo = atmo;
+    this.options = {
+      tau: opts.tau ?? DEFAULT_TERRAIN_OPTIONS.tau,
+      anisotropy: opts.anisotropy ?? DEFAULT_TERRAIN_OPTIONS.anisotropy,
+      maxTextures: opts.maxTextures ?? DEFAULT_TERRAIN_OPTIONS.maxTextures,
+      maxVisibleTiles: opts.maxVisibleTiles ?? DEFAULT_TERRAIN_OPTIONS.maxVisibleTiles,
+      disposeDelayMs: opts.disposeDelayMs ?? DEFAULT_TERRAIN_OPTIONS.disposeDelayMs,
+    };
+    this.heightAt = (x, z) => this.elevation.groundY(x, z);
+
+    // Every leaf of the selection can end up on screen, so the selection is
+    // bounded by the same budget as the visible tiles.
+    this.quadtree = new TerrainQuadtree(frame, lz, {
+      tau: this.options.tau,
+      maxLeaves: this.options.maxVisibleTiles,
+    });
+
+    cache.onEvict = (url: string): void => {
+      this.onEvict(url);
+    };
+  }
+
+  /**
+   * One step of the streaming: ask for what is missing, work out what is on
+   * screen, build the meshes of the visible tiles and dispose the rest.
+   */
+  update(cam: LodCamera): void {
+    const now = Date.now();
+    this.desiredTiles = this.quadtree.select(cam, (t) => this.heightRange(t));
+
+    for (const coord of this.desiredTiles) {
+      this.requestElevation(coord, cam, now);
+      this.requestImagery(coord, cam, now);
+    }
+
+    // The parent of every leaf, so a leaf that is not ready has something to
+    // fall back on while its own imagery is still on the way.
+    for (const coord of this.desiredTiles) {
+      this.requestFallback(coord, cam, now);
+    }
+
+    this.refreshVisible(now);
+  }
+
+  /**
+   * Work out what is on screen and build the meshes of those tiles.
+   *
+   * A leaf that has no imagery falls back to the nearest ancestor that has,
+   * so the ground is never missing: a tile that is slow or that has failed
+   * leaves its parent's texture on screen.
+   */
+  private refreshVisible(now: number): void {
+    this.visibleTiles.length = 0;
+    for (const coord of computeRenderSet(this.desiredTiles, (t) => this.isReady(t))) {
+      this.visibleTiles.push(coord);
+      this.ensureMesh(coord, now);
+    }
+    this.enforceBudget(now);
+  }
+
+  /**
+   * The height range of a tile, from the elevation tile that covers it.
+   *
+   * Before any elevation has arrived the range is a guess: from sea level to
+   * five thousand metres, which is as good as any until the ground is known.
+   */
+  heightRange(t: TileCoord): HeightRange {
+    const covering = this.coveringElevation(t);
+    if (!covering) return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
+    const range = this.elevationRanges.get(tileKey(covering));
+    if (!range) return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
+    return { min: range.min, max: range.max };
+  }
+
+  /** What the terrain is doing, for the debug overlay. */
+  stats(): { desired: number; visible: number; pending: number; built: number } {
+    let built = 0;
+    for (const state of this.tiles.values()) {
+      if (state.tile) built++;
+    }
+    return {
+      desired: this.desiredTiles.length,
+      visible: this.visibleTiles.length,
+      pending: this.pending.size,
+      built,
+    };
+  }
+
+  /** How sharp the terrain may be. A smaller tau is sharper and costlier. */
+  setTau(tau: number): void {
+    this.options.tau = tau;
+    this.quadtree.config.tau = tau;
+  }
+
+  /** The anisotropic filtering on the imagery. */
+  setAnisotropy(anisotropy: number): void {
+    this.options.anisotropy = anisotropy;
+    for (const texture of this.textures.values()) {
+      texture.anisotropy = anisotropy;
+      texture.needsUpdate = true;
+    }
+  }
+
+  /** Let go of everything: the meshes, the textures and the requests. */
+  dispose(): void {
+    for (const state of this.tiles.values()) {
+      this.disposeMesh(state);
+    }
+    this.tiles.clear();
+    this.visibleTiles.length = 0;
+    this.desiredTiles = [];
+
+    for (const url of [...this.pending.keys()]) {
+      this.cache.cancel(url);
+    }
+    this.pending.clear();
+
+    for (const texture of this.textures.values()) {
+      texture.dispose();
+    }
+    this.textures.clear();
+    this.textureOrder.clear();
+    this.elevationRanges.clear();
+  }
+
+  /** The URL of the imagery of a tile. */
+  private imageryUrlFor(coord: TileCoord): string {
+    return tileUrl(imageryProviderForZoom(coord.z), coord);
+  }
+
+  /** How far the camera is from a tile, in metres: the request priority. */
+  private distanceTo(cam: LodCamera, coord: TileCoord): number {
+    return this.quadtree.distanceToTile(cam, coord, this.heightRange(coord));
+  }
+
+  /** Ask for the imagery of a tile. */
+  private requestImagery(coord: TileCoord, cam: LodCamera, now: number): void {
+    const url = this.imageryUrlFor(coord);
+    if (this.textures.has(url)) return;
+    if (this.pending.has(url)) return;
+    const failedAt = this.failed.get(url);
+    if (failedAt !== undefined && now - failedAt < RETRY_AFTER_MS) return;
+
+    this.pending.set(url, 'image');
+    void this.cache.getImage(url, this.distanceTo(cam, coord)).then(
+      (bitmap: ImageBitmap) => {
+        this.pending.delete(url);
+        this.failed.delete(url);
+        this.onImagery(coord, url, bitmap);
+      },
+      (error: unknown) => {
+        this.pending.delete(url);
+        this.failed.set(url, Date.now());
+        console.warn(`boogie: no imagery for ${url}`, error);
+      },
+    );
+  }
+
+  /** Ask for the elevation tile a tile needs. */
+  private requestElevation(coord: TileCoord, cam: LodCamera, now: number): void {
+    const elev = this.elevation.elevationTileFor(coord);
+
+    // The ranges are what the terrain knows: a tile whose range is known does
+    // not have to be asked for again, even when the cache has thrown the
+    // heights away in the meantime.
+    if (this.elevationRanges.has(tileKey(elev))) return;
+
+    const url = tileUrl(ELEVATION_PROVIDER, elev);
+    if (this.pending.has(url)) return;
+    const failedAt = this.failed.get(url);
+    if (failedAt !== undefined && now - failedAt < RETRY_AFTER_MS) return;
+
+    this.pending.set(url, 'heights');
+    void this.cache.getHeights(url, this.distanceTo(cam, elev)).then(
+      (heights: Float32Array) => {
+        this.pending.delete(url);
+        this.failed.delete(url);
+        this.onElevation(elev, heights);
+      },
+      (error: unknown) => {
+        this.pending.delete(url);
+        this.failed.set(url, Date.now());
+        console.warn(`boogie: no elevation for ${url}`, error);
+      },
+    );
+  }
+
+  /**
+   * Ask for the imagery that stands in for a leaf that has none.
+   *
+   * The parent is asked for, and only when the parent has failed in turn is
+   * the grandparent asked for, so a tile that never arrives walks up the tree
+   * one level at a time instead of asking for the whole chain at once.
+   */
+  private requestFallback(leaf: TileCoord, cam: LodCamera, now: number): void {
+    let ancestor = parentTile(leaf);
+    while (ancestor) {
+      const url = this.imageryUrlFor(ancestor);
+      if (this.textures.has(url)) return;
+      if (this.pending.has(url)) return;
+
+      const failedAt = this.failed.get(url);
+      if (failedAt === undefined || now - failedAt >= RETRY_AFTER_MS) {
+        this.requestImagery(ancestor, cam, now);
+        this.requestElevation(ancestor, cam, now);
+        return;
+      }
+      ancestor = parentTile(ancestor);
+    }
+  }
+
+  /** The imagery has arrived: keep the texture and note the tile. */
+  private onImagery(coord: TileCoord, url: string, bitmap: ImageBitmap): void {
+    this.textureFor(url, bitmap);
+
+    const key = tileKey(coord);
+    if (!this.tiles.has(key)) {
+      this.tiles.set(key, {
+        coord,
+        bounds: this.frame.tileBoundsLocal(coord),
+        imageryUrl: url,
+        tile: null,
+        lastVisibleAt: Date.now(),
+      });
+    }
+
+    // The tile may be the one the camera is waiting for, or the parent that
+    // stands in for it: either way the ground changes now.
+    this.refreshVisible(Date.now());
+  }
+
+  /** The elevation has arrived: keep it and re-drape the tiles it covers. */
+  private onElevation(coord: TileCoord, heights: Float32Array): void {
+    try {
+      this.elevation.addTile(coord, heights);
+    } catch (error) {
+      console.warn(`boogie: bad elevation tile for ${tileKey(coord)}`, error);
+      return;
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (const height of heights) {
+      if (height < min) min = height;
+      if (height > max) max = height;
+    }
+    this.elevationRanges.set(tileKey(coord), { min, max });
+
+    // Every tile this elevation covers is draped over it again, unless it is
+    // already draped over something finer.
+    const bounds = this.frame.tileBoundsLocal(coord);
+    for (const state of this.tiles.values()) {
+      if (!state.tile) continue;
+      if (state.tile.elevZoom >= coord.z) continue;
+      if (!overlaps(state.bounds, bounds)) continue;
+      state.tile.rebuildHeights(this.heightAt, coord.z);
+    }
+  }
+
+  /** Build the mesh of a tile, if it has imagery and no mesh yet. */
+  private ensureMesh(coord: TileCoord, now: number): void {
+    const state = this.tiles.get(tileKey(coord));
+    if (!state || state.tile) return;
+
+    const texture = this.textures.get(state.imageryUrl);
+    if (!texture) return;
+
+    const tile = new TerrainTile(
+      coord,
+      state.bounds,
+      this.atmo,
+      this.heightAt,
+      this.coveringElevationZoom(coord),
+    );
+    tile.setTexture(texture);
+    tile.textureZoom = coord.z;
+
+    this.world.add(tile.mesh);
+    state.tile = tile;
+    state.lastVisibleAt = now;
+    this.touchTexture(state.imageryUrl);
+  }
+
+  /** Let go of the mesh of a tile. The texture belongs to the cache. */
+  private disposeMesh(state: TileState): void {
+    if (!state.tile) return;
+    this.world.remove(state.tile.mesh);
+    state.tile.dispose();
+    state.tile = null;
+  }
+
+  /** The imagery texture of a URL, made once and kept. */
+  private textureFor(url: string, bitmap: ImageBitmap): THREE.Texture {
+    const existing = this.textures.get(url);
+    if (existing) return existing;
+
+    const texture = new THREE.Texture(bitmap);
+    texture.flipY = false;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.generateMipmaps = true;
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.anisotropy = this.options.anisotropy;
+    texture.needsUpdate = true;
+
+    this.textures.set(url, texture);
+    this.touchTexture(url);
+    this.enforceTextureBudget();
+    return texture;
+  }
+
+  /** Move a texture to the end of the eviction order. */
+  private touchTexture(url: string): void {
+    this.textureOrder.delete(url);
+    this.textureOrder.set(url, Date.now());
+  }
+
+  /** Keep the number of textures on the GPU within the budget. */
+  private enforceTextureBudget(): void {
+    while (this.textures.size > this.options.maxTextures) {
+      const url = this.oldestUnusedTexture();
+      if (!url) return;
+      this.disposeTexture(url);
+    }
+  }
+
+  /** The oldest texture that no live mesh is showing. */
+  private oldestUnusedTexture(): string | null {
+    for (const url of this.textureOrder.keys()) {
+      if (!this.textureInUse(url)) return url;
+    }
+    return null;
+  }
+
+  /** Whether a live mesh is showing a texture. */
+  private textureInUse(url: string): boolean {
+    for (const state of this.tiles.values()) {
+      if (state.tile && state.imageryUrl === url) return true;
+    }
+    return false;
+  }
+
+  /** Let go of a texture and of the meshes that were showing it. */
+  private disposeTexture(url: string): void {
+    const texture = this.textures.get(url);
+    if (!texture) return;
+
+    for (const [key, state] of [...this.tiles]) {
+      if (state.imageryUrl !== url) continue;
+      this.disposeMesh(state);
+      this.tiles.delete(key);
+    }
+    texture.dispose();
+    this.textures.delete(url);
+    this.textureOrder.delete(url);
+  }
+
+  /**
+   * The cache has thrown a tile away: the texture goes with it, and so do the
+   * meshes that were showing it, because their texture is gone.
+   */
+  private onEvict(url: string): void {
+    this.disposeTexture(url);
+  }
+
+  /**
+   * Dispose the meshes that fell out of view and keep the number of live
+   * meshes within the budget.
+   *
+   * The visible tiles are never disposed: they are the ground. The others go
+   * once they have been out of view for the delay, so a camera that turns back
+   * finds them still there; when there are too many of them, the oldest go
+   * first.
+   */
+  private enforceBudget(now: number): void {
+    const visible = new Set(this.visibleTiles.map(tileKey));
+
+    for (const [key, state] of [...this.tiles]) {
+      if (visible.has(key)) {
+        state.lastVisibleAt = now;
+        continue;
+      }
+      if (now - state.lastVisibleAt >= this.options.disposeDelayMs) {
+        this.disposeMesh(state);
+      }
+    }
+
+    const live = [...this.tiles.values()].filter((state) => state.tile !== null);
+    const limit = this.options.maxVisibleTiles + visible.size;
+    let excess = live.length - limit;
+    if (excess <= 0) return;
+
+    const candidates = live
+      .filter((state) => !visible.has(tileKey(state.coord)))
+      .sort((a, b) => a.lastVisibleAt - b.lastVisibleAt);
+    for (const state of candidates) {
+      if (excess <= 0) break;
+      this.disposeMesh(state);
+      excess--;
+    }
+  }
+
+  /** Whether a tile has imagery and can be drawn. */
+  private isReady(coord: TileCoord): boolean {
+    const state = this.tiles.get(tileKey(coord));
+    return state !== undefined && this.textures.has(state.imageryUrl);
+  }
+
+  /**
+   * The elevation tile that covers a tile: the one it needs, or the finest
+   * of its ancestors that has arrived.
+   */
+  private coveringElevation(t: TileCoord): TileCoord | null {
+    const needed = this.elevation.elevationTileFor(t);
+    if (this.elevation.hasTile(needed)) return needed;
+
+    let x = needed.x;
+    let y = needed.y;
+    for (let z = needed.z - 1; z >= 0; z--) {
+      x = Math.floor(x / 2);
+      y = Math.floor(y / 2);
+      const ancestor: TileCoord = { z, x, y };
+      if (this.elevation.hasTile(ancestor)) return ancestor;
+    }
+    return null;
+  }
+
+  /** The zoom of the elevation a tile is draped over. */
+  private coveringElevationZoom(t: TileCoord): number {
+    return this.coveringElevation(t)?.z ?? 0;
+  }
+}
+
+/** Whether two boxes in the local frame overlap. */
+function overlaps(a: TileBounds, b: TileBounds): boolean {
+  return a.minX <= b.maxX && a.maxX >= b.minX && a.minZ <= b.maxZ && a.maxZ >= b.minZ;
+}

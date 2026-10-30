@@ -466,6 +466,59 @@ describe('Terrain', () => {
     expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16)).toBe(true);
   });
 
+  it("requests the root ring's imagery while only the root elevation is loaded", async () => {
+    const fixture = makeTerrain(makeCache({ holdElevationAbove: 8 }), { maxVisibleTiles: 400 });
+
+    // Only the elevation of the root ring arrives: every finer elevation
+    // tile is still on its way.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    const imagery = fixture.fetched.filter((url) => !isElevation(url));
+
+    // The root ring under the view is asked for, so the coarse ground is
+    // covered while the fine elevation is still missing.
+    const root = lonLatToTile(frame.origin, 8);
+    const rootUrl = tileUrl(imageryProviderForZoom(root.z), root);
+    expect(imagery).toContain(rootUrl);
+
+    // Nothing finer is asked for: the ground it would be draped on is not
+    // there yet.
+    expect(imagery.some((url) => zoomOf(url) === 16)).toBe(false);
+    expect(imagery.every((url) => zoomOf(url) === 8)).toBe(true);
+  });
+
+  it('fills in finer fallbacks as finer elevation arrives', async () => {
+    const fixture = makeTerrain(makeCache({ holdElevationAbove: 8 }), { maxVisibleTiles: 400 });
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    const root = lonLatToTile(frame.origin, 8);
+    const rootUrl = tileUrl(imageryProviderForZoom(root.z), root);
+    expect(fixture.fetched).toContain(rootUrl);
+
+    // The fine elevation arrives.
+    fixture.releaseElevation();
+    await settle(fixture.cache);
+
+    // The camera looks at the ground again, and the selection settles on the
+    // fine tiles.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The fallback of the fine tiles is asked for now that the ground under
+    // it is known: the parent of the fine leaves covers the ground while
+    // their own imagery is on its way.
+    const imagery = fixture.fetched.filter((url) => !isElevation(url));
+    expect(imagery.some((url) => zoomOf(url) === 15 || zoomOf(url) === 16)).toBe(true);
+    expect(imagery.some((url) => zoomOf(url) === 15)).toBe(true);
+
+    // The root ring is loaded already: it was asked for before the fine
+    // elevation arrived, and it is on screen.
+    expect(fixture.terrain['textures'].has(rootUrl)).toBe(true);
+  });
+
   it('cancels the imagery it no longer wants', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fixture = makeTerrain(makeCache({ concurrency: 1, hangImageFetch: true }));

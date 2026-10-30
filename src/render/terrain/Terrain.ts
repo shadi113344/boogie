@@ -276,8 +276,8 @@ export class Terrain {
    * without the heights there is nothing to drape the tile on, and the
    * selection is about to change anyway. The elevation tiles are coarse and
    * few, so the ground is known one round trip later and the imagery can
-   * follow. The fallback of such a tile waits as well, for the same reason:
-   * the parent is only worth asking for once the ground is there.
+   * follow. The fallback of such a tile does not wait: the fallback is
+   * exactly what covers the ground while the tile itself is on its way.
    *
    * "Known" means the elevation tile the imagery is draped on, not just any
    * elevation tile that covers it: a coarse tile says nothing about how fine
@@ -294,9 +294,10 @@ export class Terrain {
     }
 
     // The parent of every leaf, so a leaf that is not ready has something to
-    // fall back on while its own imagery is still on the way.
+    // fall back on while its own imagery is still on the way. The leaf itself
+    // does not have to be ready: the fallback is exactly for the leaves whose
+    // own ground is not known yet.
     for (const coord of nearest) {
-      if (!this.elevationReady(coord)) continue;
       this.requestFallback(coord, cam, now);
     }
   }
@@ -496,18 +497,21 @@ export class Terrain {
   /**
    * Ask for the imagery that stands in for a leaf that has none.
    *
-   * The parent is asked for, and only when the parent has failed in turn is
-   * the grandparent asked for, so a tile that never arrives walks up the tree
-   * one level at a time instead of asking for the whole chain at once. The
-   * walk stops at the root ring of the quadtree: below it there is nothing
-   * but the ring itself.
+   * The walk starts at the parent of the leaf and climbs to the root ring of
+   * the quadtree: below it there is nothing but the ring itself.
    *
-   * The elevation of the ancestor is always asked for: it is what tells the
-   * terrain how high the ground is under the tile that is still on its way.
-   * The imagery of the ancestor waits for that ground: the ancestor is
-   * draped on the elevation tile of its own zoom, so the imagery of a
-   * fallback waits for the elevation of that zoom and not for any tile that
-   * happens to cover it.
+   * The walk does not stop at an ancestor whose ground is not known yet: it
+   * asks for that ground and climbs on. The fine ancestors are draped on the
+   * finest elevation tile, and that tile takes a while to arrive for the
+   * whole view, so a walk that stopped there would never reach the coarse
+   * ring and the ground would stay empty until the fine elevation was in.
+   * The ring is asked for first and the finer fallbacks follow as the finer
+   * elevation arrives.
+   *
+   * The walk stops at the first ancestor that covers the ground: one whose
+   * imagery has arrived or is on its way, and one whose ground is known and
+   * whose imagery can be asked for now. An ancestor whose imagery has failed
+   * is left alone and the walk goes on to the next one up.
    */
   private requestFallback(leaf: TileCoord, cam: LodCamera, now: number): void {
     const rootZoom = this.quadtree.config.rootZoom;
@@ -518,12 +522,23 @@ export class Terrain {
       if (this.pending.has(url)) return;
 
       const failedAt = this.failed.get(url);
-      if (failedAt === undefined || now - failedAt >= RETRY_AFTER_MS) {
-        this.requestElevation(ancestor, cam, now);
-        if (this.elevationReady(ancestor)) this.requestImagery(ancestor, cam, now);
-        return;
+      if (failedAt !== undefined && now - failedAt < RETRY_AFTER_MS) {
+        // The imagery of this ancestor failed: the next one up stands in for
+        // it instead.
+        ancestor = parentTile(ancestor);
+        continue;
       }
-      ancestor = parentTile(ancestor);
+
+      if (!this.elevationReady(ancestor)) {
+        // The ground under the ancestor is not known yet: ask for it and
+        // keep climbing, so that the coarse ring is asked for as well.
+        this.requestElevation(ancestor, cam, now);
+        ancestor = parentTile(ancestor);
+        continue;
+      }
+
+      this.requestImagery(ancestor, cam, now);
+      return;
     }
   }
 

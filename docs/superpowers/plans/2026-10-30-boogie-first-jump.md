@@ -28,7 +28,7 @@
 1. **A frame that arrives late, or a tab that comes back from the background mid-jump.** The jump must continue where it was: at most 12 sim steps per frame, never a jump ahead, never a NaN. Owner: Task 1 (`FixedStep`) and Task 11 (the session resumes after `visibilitychange`).
 2. **Tilt unavailable or refused** (desktop, iOS permission denied, a phone without a gyroscope). The start screen falls back to touch with a one-line note and the jump starts. Owner: Task 7.
 3. **Body mass at the ends of the range, 55 kg and 110 kg.** Freefall and canopy stay finite and ordered: heavier falls faster, flies faster under the same canopy and lands harder. Owner: Tasks 3 and 13.
-4. **A pull that comes too late or never.** No pull: the AAD fires the reserve at about 750 ft. A pull at 1,000 ft: the opening is not finished at the ground and the outcome says so. The debrief explains both. Owner: Tasks 12, 14 and 15.
+4. **A pull that comes too late or never.** No pull: the AAD fires the reserve at about 750 ft. A pull at 500 ft: the opening is not finished at the ground and the outcome says so. The debrief explains both. Owner: Tasks 12, 14 and 15.
 5. **Inputs that do not apply:** pulling twice, toggles before the brakes are unstowed, a PLF gesture in freefall, keys held across the opening. All are ignored without errors and logged as they were. Owner: Tasks 5, 13 and 14.
 
 ## Where this plan departs from the spec, and why
@@ -683,10 +683,10 @@ The phases: `freefall` → (throw) `opening` → (`open`) `canopy` → (touchdow
 
 - [ ] **Step 1: Failing tests:**
   - `classifyLanding` for one case on each side of every boundary.
-  - **Flare** (`tests/sim/flare.test.ts`; sea level, 97 kg, flat ground, settled full flight; the standard stroke: both toggles 0 → 0.5 over 0.3 s, then to 0.9 over 0.8 s, started at a height H): every main canopy has an H in 6 to 30 ft where touchdown is under 1.5 m/s vertical and under 8 m/s ground speed in calm air; for the Sport 170 such an H lies in 10 to 20 ft; at that best H the canopy's sink stays under 1 m/s for at least 1.5 s; started at 4 ft the touchdown is at least 70 percent of the full-flight sink; started at 2 × best + 6 ft it lands at least 0.4 m/s harder than at the best H; the Sport 210 flared at its best H into a 4 m/s headwind is a `stand-up`.
+  - **Flare** (`tests/sim/flare.test.ts`; sea level, 97 kg, flat ground, settled full flight; the standard stroke: both toggles 0 → 0.5 over 0.3 s, then to 0.9 over 0.8 s, started at a height H): every main canopy has an H in 6 to 30 ft where touchdown is under 1.5 m/s vertical and under 8 m/s ground speed in calm air; for the Sport 170 such an H lies in 10 to 20 ft; at that best H the canopy's sink stays under 1 m/s for at least 1.5 s; started at 4 ft the touchdown is at least 55 percent of the full-flight sink and at least 0.5 m/s harder than at the best H (the slow student canopy keeps a little of the late stroke); started at 2 × best + 6 ft it lands at least 0.4 m/s harder than at the best H; the Sport 210 flared at its best H into a 4 m/s headwind is a `stand-up`.
   - **Full jump** (seed 1, flat ground 568 m, typical wind, exit 13,500 ft from `defaultExit`, neutral freefall, pull at 3,500 ft, unstow 3 s after `open`, a scripted pattern: hold the heading into the surface wind from 1,000 ft, the standard stroke at 12 ft): events in order exit, alarm ×2, pull, stage…, open, unstow, touchdown, outcome; freefall 55 to 65 s; opening from throw to `open` 3.7 to 5.2 s; the outcome is neither `injury` nor `fatal`.
   - **No pull:** the AAD fires between 700 and 800 ft and the reserve is `open` above 200 ft.
-  - **Pull at 1,000 ft:** the outcome is `injury` or `fatal`.
+  - **Pull at 500 ft:** the opening (600 to 900 ft) cannot finish; the outcome is `injury` or `fatal`. A pull at 1,000 ft opens around 200 to 400 ft and lands.
   - **Inputs that do not apply:** toggles before unstowing change nothing; PLF in freefall changes nothing; replaying the input log reproduces the touchdown point to 1e-9.
 - [ ] **Step 2: Run, fail. Step 3: Implement. Step 4: Run, pass.**
 - [ ] **Step 5: Commit** `feat(sim): opening to landing, the AAD, flare and landing outcomes`

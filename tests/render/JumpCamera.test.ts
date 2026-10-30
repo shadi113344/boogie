@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { PerspectiveCamera, Vector3 } from 'three';
-import { freefallEye, JumpCamera, type CameraPose } from '@/render/JumpCamera';
+import {
+  canopyEye,
+  freefallEye,
+  JumpCamera,
+  openingEye,
+  type CameraPose,
+} from '@/render/JumpCamera';
 import type { BodyFrame } from '@/sim/freefall/aero';
 
 const NORTH = { x: 0, y: 0, z: -1 };
@@ -66,6 +72,145 @@ describe('freefallEye', () => {
       pose.up.x * pose.forward.x +
       pose.up.y * pose.forward.y +
       pose.up.z * pose.forward.z;
+    expect(along).toBeCloseTo(0, 9);
+  });
+});
+
+describe('canopyEye', () => {
+  const here = { x: 0, y: 1000, z: 0 };
+
+  it('looks 15 degrees below the horizon along the heading', () => {
+    const pose = canopyEye({
+      pos: here,
+      headingRad: 0,
+      swingFore: 0,
+      swingSide: 0,
+      lookUp: 0,
+    });
+
+    expect(pitchDeg(pose.forward)).toBeGreaterThan(-16);
+    expect(pitchDeg(pose.forward)).toBeLessThan(-14);
+    // Along the heading: north.
+    expect(pose.forward.z).toBeLessThan(0);
+    expect(Math.abs(pose.forward.x)).toBeLessThan(1e-9);
+  });
+
+  it('looks along the heading it is given', () => {
+    const pose = canopyEye({
+      pos: here,
+      headingRad: 90 * DEG,
+      swingFore: 0,
+      swingSide: 0,
+      lookUp: 0,
+    });
+
+    // East.
+    expect(pose.forward.x).toBeGreaterThan(0.9);
+    expect(Math.abs(pose.forward.z)).toBeLessThan(0.1);
+  });
+
+  it('puts the eye a quarter of a metre above the jumper', () => {
+    const pose = canopyEye({
+      pos: { x: 10, y: 1000, z: 20 },
+      headingRad: 0,
+      swingFore: 0,
+      swingSide: 0,
+      lookUp: 0,
+    });
+
+    expect(pose.position.x).toBeCloseTo(10, 9);
+    expect(pose.position.y).toBeCloseTo(1000.25, 9);
+    expect(pose.position.z).toBeCloseTo(20, 9);
+  });
+
+  it('looks straight up the lines when the player looks up', () => {
+    const pose = canopyEye({
+      pos: here,
+      headingRad: 0,
+      swingFore: 0,
+      swingSide: 0,
+      lookUp: 1,
+    });
+
+    const fromUp = (Math.acos(pose.forward.y) / DEG);
+    expect(fromUp).toBeLessThan(10);
+    // The world is still upright: the up of the screen is the heading.
+    expect(pose.up.z).toBeLessThan(0);
+  });
+
+  it('tips the view with the swing', () => {
+    const still = canopyEye({
+      pos: here,
+      headingRad: 0,
+      swingFore: 0,
+      swingSide: 0,
+      lookUp: 0,
+    });
+    const swung = canopyEye({
+      pos: here,
+      headingRad: 0,
+      swingFore: 15 * DEG,
+      swingSide: 0,
+      lookUp: 0,
+    });
+
+    // The jumper swung ahead of the canopy has their head tipped back.
+    expect(pitchDeg(swung.forward)).toBeGreaterThan(pitchDeg(still.forward));
+  });
+
+  it('keeps the up square to the view', () => {
+    const pose = canopyEye({
+      pos: here,
+      headingRad: 30 * DEG,
+      swingFore: 5 * DEG,
+      swingSide: 5 * DEG,
+      lookUp: 0.4,
+    });
+
+    const along =
+      pose.up.x * pose.forward.x +
+      pose.up.y * pose.forward.y +
+      pose.up.z * pose.forward.z;
+    expect(along).toBeCloseTo(0, 9);
+  });
+});
+
+describe('openingEye', () => {
+  const from: CameraPose = {
+    position: { x: 0, y: 1000, z: 0 },
+    forward: { x: 0, y: -1, z: 0 },
+    up: { x: 0, y: 0, z: -1 },
+  };
+  const to: CameraPose = {
+    position: { x: 0, y: 1000, z: 0 },
+    forward: { x: 0, y: -0.2, z: -0.98 },
+    up: { x: 0, y: 0.98, z: -0.2 },
+  };
+
+  it('looks down at the start and ahead at the end', () => {
+    const start = openingEye(from, to, 0);
+    expect(start.forward.y).toBeCloseTo(-1, 6);
+
+    const end = openingEye(from, to, 1);
+    expect(end.forward.z).toBeCloseTo(to.forward.z, 6);
+    expect(end.forward.y).toBeCloseTo(to.forward.y, 6);
+  });
+
+  it('swings through the snivel on the way', () => {
+    const middle = openingEye(from, to, 0.5);
+
+    expect(middle.forward.y).toBeLessThan(0);
+    expect(middle.forward.z).toBeLessThan(0);
+    expect(middle.forward.y).toBeGreaterThan(-1);
+  });
+
+  it('keeps the up square to the view', () => {
+    const middle = openingEye(from, to, 0.5);
+
+    const along =
+      middle.up.x * middle.forward.x +
+      middle.up.y * middle.forward.y +
+      middle.up.z * middle.forward.z;
     expect(along).toBeCloseTo(0, 9);
   });
 });

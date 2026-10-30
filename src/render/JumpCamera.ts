@@ -11,7 +11,7 @@
  */
 
 import * as THREE from 'three';
-import { type Vec3, add, dot, normalize, scale, sub } from '@/sim/vec3';
+import { type Vec3, add, cross, dot, normalize, scale, sub } from '@/sim/vec3';
 import type { BodyFrame } from '@/sim/freefall/aero';
 
 /** The angle of the view from the relative wind towards the head, in radians. */
@@ -19,6 +19,12 @@ const LOOK_FROM_WIND_RAD = (40 * Math.PI) / 180;
 
 /** How far in front of the body the eye sits, in metres. */
 const EYE_OFFSET_M = 0.15;
+
+/** How far below the horizon the view looks under canopy, in radians. */
+const CANOPY_PITCH_RAD = (15 * Math.PI) / 180;
+
+/** How far the eye sits above the jumper's shoulders, in metres. */
+const EYE_HEIGHT_M = 0.25;
 
 /** The largest shake for one g of deceleration, in radians. */
 const SHAKE_RAD_PER_G = (0.4 * Math.PI) / 180;
@@ -70,6 +76,94 @@ export function freefallEye(body: BodyFrame, airDir: Vec3, pos: Vec3): CameraPos
 
   return {
     position: add(pos, scale(head, EYE_OFFSET_M)),
+    forward,
+    up,
+  };
+}
+
+/**
+ * The pose of the eye under canopy.
+ *
+ * The jumper hangs from the risers, so the head tips with the swing: a
+ * jumper swung ahead of the canopy has their head tipped back and looks
+ * up, and a jumper hanging to the right of the canopy has their head tipped
+ * to the left. The view looks fifteen degrees below the horizon along the
+ * heading, and `lookUp` takes it up the lines instead, which is the canopy
+ * check: the player tilts the phone back and looks at the wing.
+ */
+export function canopyEye(o: {
+  pos: Vec3;
+  headingRad: number;
+  swingFore: number;
+  swingSide: number;
+  lookUp: number;
+}): CameraPose {
+  const lookUp = clamp01(o.lookUp);
+
+  // The heading: the way the canopy is flying, on the level.
+  const heading: Vec3 = { x: Math.sin(o.headingRad), y: 0, z: -Math.cos(o.headingRad) };
+
+  // The body of the jumper: the head hangs from the risers, so it tips
+  // forward when the jumper swings ahead of the canopy and to the left when
+  // the jumper hangs to the right of it.
+  const bodyForward = normalize({
+    x: heading.x * Math.cos(o.swingFore),
+    y: Math.sin(o.swingFore),
+    z: heading.z * Math.cos(o.swingFore),
+  });
+  const aft: Vec3 = { x: -heading.x, y: 0, z: -heading.z };
+  const tipped = normalize({
+    x: aft.x * Math.sin(o.swingFore),
+    y: Math.cos(o.swingFore),
+    z: aft.z * Math.sin(o.swingFore),
+  });
+  const left = cross(tipped, bodyForward);
+  const bodyUp = normalize({
+    x: tipped.x * Math.cos(o.swingSide) + left.x * Math.sin(o.swingSide),
+    y: tipped.y * Math.cos(o.swingSide) + left.y * Math.sin(o.swingSide),
+    z: tipped.z * Math.cos(o.swingSide) + left.z * Math.sin(o.swingSide),
+  });
+
+  // The view: fifteen degrees below the body, swinging up the lines as the
+  // player looks up.
+  const base = normalize({
+    x: bodyForward.x * Math.cos(CANOPY_PITCH_RAD) - bodyUp.x * Math.sin(CANOPY_PITCH_RAD),
+    y: bodyForward.y * Math.cos(CANOPY_PITCH_RAD) - bodyUp.y * Math.sin(CANOPY_PITCH_RAD),
+    z: bodyForward.z * Math.cos(CANOPY_PITCH_RAD) - bodyUp.z * Math.sin(CANOPY_PITCH_RAD),
+  });
+  const forward = slerp(base, bodyUp, lookUp);
+
+  // The screen's up: the head while the player looks ahead, the way the
+  // jumper was facing once they look up at the canopy.
+  const wanted = slerp(bodyUp, bodyForward, lookUp);
+  const up = perpendicular(wanted, forward) ?? anyPerpendicular(forward);
+
+  return {
+    position: { x: o.pos.x, y: o.pos.y + EYE_HEIGHT_M, z: o.pos.z },
+    forward,
+    up,
+  };
+}
+
+/**
+ * The pose of the eye through the opening.
+ *
+ * The opening starts with the jumper looking down at the ground and ends
+ * with them looking ahead through the snivel, at the canopy and the world
+ * beyond it. The inflation drives the swing from one to the other.
+ */
+export function openingEye(from: CameraPose, to: CameraPose, inflation: number): CameraPose {
+  const t = clamp01(inflation);
+
+  const forward = slerp(from.forward, to.forward, t);
+  const up = perpendicular(slerp(from.up, to.up, t), forward) ?? anyPerpendicular(forward);
+
+  return {
+    position: {
+      x: from.position.x + (to.position.x - from.position.x) * t,
+      y: from.position.y + (to.position.y - from.position.y) * t,
+      z: from.position.z + (to.position.z - from.position.z) * t,
+    },
     forward,
     up,
   };
@@ -145,6 +239,39 @@ function perpendicular(v: Vec3, axis: Vec3): Vec3 | null {
   const part = sub(v, scale(axis, dot(v, axis)));
   if (Math.hypot(part.x, part.y, part.z) < 1e-6) return null;
   return normalize(part);
+}
+
+/**
+ * The direction between two directions, the short way round.
+ *
+ * The two directions are unit vectors and the result is one: a camera
+ * swinging from one to the other keeps the same speed the whole way, which
+ * a straight line between the two would not.
+ */
+function slerp(a: Vec3, b: Vec3, t: number): Vec3 {
+  const cos = Math.max(-1, Math.min(1, dot(a, b)));
+  const theta = Math.acos(cos);
+  if (theta < 1e-6) return normalize(lerp(a, b, t));
+
+  const sinTheta = Math.sin(theta);
+  const first = Math.sin((1 - t) * theta) / sinTheta;
+  const second = Math.sin(t * theta) / sinTheta;
+  return {
+    x: a.x * first + b.x * second,
+    y: a.y * first + b.y * second,
+    z: a.z * first + b.z * second,
+  };
+}
+
+/** The straight line between two vectors. */
+function lerp(a: Vec3, b: Vec3, t: number): Vec3 {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t };
+}
+
+/** Keeps a number inside the range from zero to one. */
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
 }
 
 /** Any unit vector square to `axis`. */

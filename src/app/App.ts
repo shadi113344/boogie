@@ -36,10 +36,14 @@ export interface AppOptions {
   quality?: QualityTier;
 }
 
-/** Height of the camera at the start: 13,500 ft above mean sea level. */
+/**
+ * The exit height: 13,500 ft. The camera parks at it above mean sea level
+ * while it waits for the ground, and the exit button puts it at that height
+ * above the landing area.
+ */
 const EXIT_ALTITUDE_M = 4115;
 
-/** One thousand feet above mean sea level: the low pass over the drop zone. */
+/** One thousand feet: the low pass over the drop zone. */
 const LOW_ALTITUDE_M = 305;
 
 /** The height above the ground the camera keeps, in metres. */
@@ -52,8 +56,11 @@ const FOV_DEG = 60;
 const NEAR_M = 1;
 const FAR_M = 600000;
 
-/** Downward tilt at the start, in radians. */
+/** Downward tilt of the parked camera, in radians. */
 const START_PITCH_RAD = -Math.PI / 4;
+
+/** Downward tilt at the exit, in radians: sixty degrees below the horizon. */
+const EXIT_PITCH_RAD = -Math.PI / 3;
 
 /** How often the overlay is refreshed, in milliseconds. */
 const HUD_INTERVAL_MS = 100;
@@ -125,6 +132,9 @@ export class App {
   /** When the current window began, in frame time. */
   private updateWindowStart = Number.NaN;
 
+  /** Whether the camera has been put at the exit height above the ground. */
+  private atExit = false;
+
   constructor(canvas: HTMLCanvasElement, opts: AppOptions) {
     this.canvas = canvas;
     this.options = opts;
@@ -183,6 +193,8 @@ export class App {
         z + this.floatingOrigin.offset.z,
       ),
     );
+    // The camera parks at the exit height, looking down, until the ground
+    // under the landing area is known: the exit is a height above it.
     this.freeCamera.setPose(0, EXIT_ALTITUDE_M, 0, 0, START_PITCH_RAD);
 
     // The sun, for today in the drop zone's own time zone.
@@ -203,6 +215,10 @@ export class App {
     // line away, without a build of the app.
     if (opts.debug) {
       (window as unknown as { __boogie?: unknown }).__boogie = this;
+
+      // The camera buttons are the developer's: they stay hidden otherwise.
+      const buttons = document.querySelector<HTMLElement>('#camera-buttons');
+      if (buttons) buttons.removeAttribute('hidden');
 
       const ui = document.querySelector<HTMLElement>('#ui');
       if (ui) {
@@ -238,6 +254,10 @@ export class App {
     const started = performance.now();
     this.terrain.update(this.lodCamera(this.floatingOrigin.truePosition(this.camera)));
     this.measureUpdate(performance.now() - started, now);
+
+    // The exit pose waits for the ground: the camera is put at the exit
+    // height above the landing area, once the elevation under it has arrived.
+    this.placeAtExit();
 
     this.sky.update(this.camera.position);
     this.atmosphere.setCameraY(this.camera.position.y);
@@ -320,6 +340,24 @@ export class App {
     this.terrain.setAnisotropy(
       Math.min(settings.anisotropy, this.renderer.gl.capabilities.getMaxAnisotropy()),
     );
+    this.terrain.setMaxTextures(settings.maxTextures);
+  }
+
+  /**
+   * Put the camera at the exit height above the landing area.
+   *
+   * The exit is a height above the ground, so the ground has to be known
+   * first: the elevation under the landing area is asked for every frame
+   * until it arrives, and the camera is put at the exit once, when it does.
+   */
+  private placeAtExit(): void {
+    if (this.atExit) return;
+
+    const sample = this.elevation.sample(this.options.dz.lz);
+    if (!sample) return;
+
+    this.atExit = true;
+    this.goto(sample.height + exitAltitudeM(this.options.dz), EXIT_PITCH_RAD);
   }
 
   /**
@@ -330,12 +368,15 @@ export class App {
     for (const button of document.querySelectorAll<HTMLButtonElement>('#ui button[data-pose]')) {
       const pose = button.dataset.pose;
       button.addEventListener('click', () => {
+        // The poses are heights above the landing area, so the ground under
+        // it is read at the moment of the click.
+        const ground = this.elevation.groundY(0, 0);
         if (pose === 'exit') {
-          this.goto(EXIT_ALTITUDE_M, -Math.PI / 3);
+          this.goto(ground + EXIT_ALTITUDE_M, -Math.PI / 3);
         } else if (pose === 'low') {
-          this.goto(LOW_ALTITUDE_M, -Math.PI / 6);
+          this.goto(ground + LOW_ALTITUDE_M, -Math.PI / 6);
         } else {
-          this.goto(this.elevation.groundY(0, 0) + MIN_CLEARANCE_M, 0);
+          this.goto(ground + MIN_CLEARANCE_M, 0);
         }
       });
     }
@@ -423,4 +464,13 @@ export class App {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
   }
+}
+
+/**
+ * The exit altitude of a drop zone, in metres.
+ *
+ * The drop zone gives its exit height in feet, the world in metres.
+ */
+function exitAltitudeM(dz: { exitAltitudeFt: number }): number {
+  return dz.exitAltitudeFt * 0.3048;
 }

@@ -4,12 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
     <title>Boogie</title>
+    <style>
+      /* The camera buttons are hidden until the app is started in debug
+         mode: the inline display of the row would otherwise win. */
+      #camera-buttons[hidden] {
+        display: none;
+      }
+    </style>
   </head>
   <body>
     <canvas id="view"></canvas>
     <div id="ui">
       <div
         id="camera-buttons"
+        hidden
         style="
           position: absolute;
           right: 8px;

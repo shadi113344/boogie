@@ -1,31 +1,7 @@
 import './style.css';
 import { App } from '@/app/App';
 import type { QualityTier } from '@/app/Quality';
-import type { LonLat } from '@/world/geo';
-
-interface DropZoneLike {
-  lz: LonLat;
-  timeZone: string;
-  exitAltitudeFt: number;
-}
-
-/**
- * The drop zone behind `?dz=`.
- *
- * Task 12 replaces this with the drop-zone table; until then Interlaken is
- * the only one and every other id falls back to it.
- */
-function resolveDropZone(id: string): DropZoneLike {
-  switch (id.trim().toLowerCase()) {
-    case 'interlaken':
-    default:
-      return {
-        lz: { lon: 7.88, lat: 46.68 },
-        timeZone: 'Europe/Zurich',
-        exitAltitudeFt: 13500,
-      };
-  }
-}
+import { DEFAULT_DROP_ZONE_ID, findDropZone } from '@/data/dropzones';
 
 function parseHour(raw: string | null): number {
   if (raw === null) return 10;
@@ -50,7 +26,10 @@ function parseDebug(raw: string | null): boolean {
 }
 
 const params = new URLSearchParams(window.location.search);
-const dz = resolveDropZone(params.get('dz') ?? 'interlaken');
+
+// The drop zone of the URL, or the default one when the URL names a drop
+// zone that does not exist.
+const dz = findDropZone(params.get('dz') ?? DEFAULT_DROP_ZONE_ID) ?? findDropZone(DEFAULT_DROP_ZONE_ID)!;
 const hourLocal = parseHour(params.get('t'));
 const quality = parseQuality(params.get('q'));
 const debug = parseDebug(params.get('debug'));

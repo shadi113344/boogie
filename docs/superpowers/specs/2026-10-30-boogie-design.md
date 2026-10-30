@@ -46,15 +46,18 @@ Tandem, BASE, freeflying (sit and head-down), multiplayer, accounts and cloud sy
 - Performance targets: 60 fps on an iPhone 12-class or 2021 mid-range Android, never below 30 fps on anything from 2019. Budgets: under 300 draw calls per frame, under 1.5 million visible triangles, under 300 MB GPU texture memory, under 4 MB of JavaScript, first jump playable within 20 seconds on 4G including the drop-zone tile prefetch.
 - Device sensors: tilt via DeviceOrientation (iOS asks permission on a user gesture and requires HTTPS, which GitHub Pages provides). Haptics via the Vibration API where available.
 - Audio starts only after a user gesture (iOS rule), so the manifest screen's "board" button is the gesture.
+- Test devices: Shadi has an iPhone, an Android phone and a Windows desktop, and will do a short pass on both phones at the end of every milestone. Development happens on Windows; the phones reach the dev server over the local network with a self-signed certificate (tilt and audio need HTTPS), and the deployed page for everything else. **[Shadi]**
 
 ## 4. How it gets made **[Claude]**
 
 Shadi handed me the technical choices.
 
 - **Stack:** Vite, TypeScript, three.js (WebGL2). Vanilla TypeScript for UI with HTML templates and a tiny reactive store, no UI framework, to keep the surface small for a delegated implementer. Vitest for unit tests. Playwright for a smoke test of boot and a scripted jump.
-- **Hosting:** GitHub Pages from a GitHub Actions workflow on every push to `main`, in a repository under Shadi's GitHub account. **[Shadi: "put it online for me"]**
+- **Hosting:** GitHub Pages from a GitHub Actions workflow on every push to `main`, in a **public** repository under Shadi's GitHub account (the free plan serves Pages only from public repositories; the code can go private later when the app moves to a paid host). **[Shadi: "put it online for me"; public repo chosen 2026-10-30]**
 - **App shell later:** Capacitor. Consequences now: no browser-only APIs that break inside a WebView, no popups, storage in IndexedDB and Cache Storage, sensors through standard web APIs with a thin adapter so Capacitor plugins can replace them.
-- **Who writes the code:** MiniMax, through its API, is the implementer for every task. Claude writes this design, the plan, each task brief, reviews every diff, runs the tests and lands on `main`. If a task bounces twice, Claude finishes it and says so. **[Shadi: "use minimax for doing all the coding"]**
+- **Who writes the code:** MiniMax is the implementer for every task. Claude writes this design, the plan, each task brief, reviews every diff, runs the tests and lands on `main`. If a task bounces twice, Claude finishes it and says so. **[Shadi: "use minimax for doing all the coding"]**
+- **How MiniMax is run:** as a full agentic coding harness, not a prompt-in, code-out call. The `claude` command-line tool is pointed at MiniMax's Anthropic-compatible endpoint (model `MiniMax-M3`, about 200k context) with its own config directory and MCP servers disabled, started inside a git worktree for the task with edit permissions. It can read the repository, edit files, run Vitest and iterate on failures before it reports. The key is read from Shadi's key file at launch and never written anywhere. One worktree per task, one task at a time per set of files. Tasks are sized to fit one context: a brief, the files to touch, the tests that must pass, what to leave alone. The pieces the reviewer expects to bounce (terrain streaming, the opening sequence, the attitude controller) get the most detailed briefs and reference pseudocode in the plan, and MiniMax still goes first.
+- **Branch and repository:** default branch `main`; repository named `boogie`; the old game moves to `legacy/` in the first commit of the scaffold.
 - **Repository layout:**
   - `src/sim/` pure simulation, no DOM, no three.js, deterministic, seeded, fixed timestep.
   - `src/world/` real-world data: tile math, elevation and imagery providers, caching, prefetch.
@@ -71,7 +74,7 @@ Shadi handed me the technical choices.
 
 This is the spine of the product. Every screen serves one of these steps.
 
-1. **Manifest.** Home screen. Pick the drop zone (preloaded list or search), see today's conditions (surface wind and direction, winds aloft, cloud base, temperature, sun), pick the kit (jumpsuit, tracking suit, wingsuit), the canopy, the pull altitude (default 3,500 ft; 2,500 to 5,500), the audible altimeter settings, and whether the guide jumps with you. "Manifest on load 3." The logbook lives here too.
+1. **Manifest.** Home screen. Pick the drop zone (preloaded list or search), see today's conditions (surface wind and direction, winds aloft, cloud base, temperature, sun), pick the kit (jumpsuit, tracking suit, wingsuit), the canopy, the pull altitude (default 3,500 ft; 2,500 to 5,500), the audible altimeter settings, and whether the guide jumps with you. "Manifest on load 3." The logbook lives here too, and so does the jumper's profile: body weight, declared licence (student, A, B, C, D) and declared jump numbers, which a real manifest would also ask for. "Today's conditions" are real when online: current surface wind and gusts, winds aloft at the standard pressure levels, cloud cover and an estimated base, temperature, all from Open-Meteo (free, no key), cached for offline use and shown with the fetch time. The presets in section 6 are an override ("make it sporty") and the offline fallback. **[Claude]**
 2. **Boarding and climb.** Gear check overlay (handles, chest strap, three rings, pin check as a tap-through that teaches non-jumpers). The climb is compressed to about 60 seconds with the view out the door, altimeter winding up, engine note, cold light at altitude. A "skip to jump run" button is always there.
 3. **Jump run.** The aircraft flies the run into wind at exit altitude. Door opens, light goes red then green. A spotting view looks straight down past the door. The ideal exit point is upwind of the landing area by the drift the winds will give you in freefall and under canopy, and the game computes it; the player decides when to go. The guide says "good spot" or "give it five seconds" if enabled. Climb out and exit on a swipe.
 4. **Freefall.** The hill: relative wind from the front at aircraft speed, rotating to vertical as you accelerate to terminal over ten to twelve seconds. Then flying: turns, forward and backward drive, fall rate, tracking. The guide docks, flies in front, gives signals (arch, legs out, relax, check altitude, pull). Audible beeps at the set altitudes. Break-off: the guide turns and tracks away, you track, wave off.
@@ -96,7 +99,7 @@ A drop zone is data: name, country, landing-area centre (latitude, longitude), l
 | Hinton Skydiving Centre, Hinton-in-the-Hedges | UK | 52.03 N, 1.21 W | hedgerows, a disused airfield, often windy |
 | Skydive Switzerland, Interlaken | Switzerland | 46.68 N, 7.88 E | two lakes, the Eiger wall, the one that sells the idea on sight |
 
-Interlaken and Dubai get polished first because they prove "jump anywhere" at a glance. Search for anywhere else uses a free geocoder (Nominatim, rate-limited and attributed) and drops a default 100 m landing circle at the chosen point, with no hazards. Lauterbrunnen's cliffs, next to Interlaken, are the first BASE site in version two.
+Interlaken and Dubai get polished first because they prove "jump anywhere" at a glance. Search for anywhere else uses a free geocoder (Nominatim, rate-limited and attributed) and drops a default 100 m landing circle at the chosen point, with no hazards. Every drop zone screen has an "adjust landing area" mode: drag the circle on the satellite image, resize it, mark water and the runway. That is how the preloaded six get confirmed by the friends who jump there (they know which field is the landing area at Gryttjom; a map does not), and how a searched-for place becomes a proper drop zone. Confirmed polygons are copied back into `src/data/` by hand. Display units (feet and mph, or metres and km/h) are a per-player setting defaulting to the drop zone's convention: metres at Gryttjom, Interlaken and Empuriabrava, feet elsewhere. Lauterbrunnen's cliffs, next to Interlaken, are the first BASE site in version two. **[Claude]**
 
 ### Data sources and licensing **[Claude]**
 
@@ -173,7 +176,7 @@ Target table for the included canopies, default jumper (exit weight about 214 lb
 | Elliptical 150 | 150 ft² | 1.43 | 33 mph | 1,300 fpm | 23 mph, 800 fpm | 180 to 220 ft | 400 to 500 ft | 4 to 5 s |
 | Reserve 220 (7-cell) | 220 ft² | 0.97 | 22 mph | 800 fpm | | docile | docile | short |
 
-Names are generic on purpose: real model names are trademarks and this is heading for the stores. Behaviour is modelled on the real equivalents. Canopy choice is limited by the kit in the manifest: a first jumper is offered the Student 280 and the Sport 210; the Elliptical 150 unlocks only by jump count in the logbook, the way a real DZ would, and the rule is stated, not gamified.
+Names are generic on purpose: real model names are trademarks and this is heading for the stores. Behaviour is modelled on the real equivalents. Canopy choice follows the declared licence and jump numbers in the profile plus the logbook, the way a real drop zone's chief instructor would: a student or someone with no declared licence is offered the Student 280 and the Sport 210; an A licence or 25 declared jumps adds the Sport 170; a B licence or 100 jumps adds nothing new but the hint; a C or D licence or 500 jumps adds the Elliptical 150. The rule is shown in plain words next to the choice. A friend with a thousand jumps types that in once and gets the canopy they fly. Nothing is "unlocked" by playing well. **[Claude]**
 
 ### 7.3 Opening sequence
 
@@ -241,7 +244,7 @@ Mouse moves the body (freefall) or the toggles (canopy, left and right mouse but
 
 - **First-person:** forearms and gloved hands from the rigged jumper model, posed by the inputs (a turn dips an arm; de-arching brings the hands in), a wrist altimeter on the left (analogue dial by default, a digital option), a goggle vignette, head motion from turbulence and the opening shock. Under canopy: risers, toggles in the hands moving with the brake input, the canopy above with cells that deform with the brakes, lines, and the slider. Nothing else on screen except the control hints the player has not yet dismissed and the emergency handles when they apply.
 - **Third-person and replay:** a full jumper with container, helmet, jumpsuit or wingsuit, animated by blending authored poses (box, arch, de-arch, track, wingsuit, reach and throw, legs up under canopy, PLF) with procedural inverse kinematics for toggles and handles; the guide uses the same model in different colours. Budget 8,000 triangles per jumper, 3,000 per canopy, 6,000 for the aircraft.
-- **Assets:** a CC0 base human adapted in Blender (Shadi's Blender is reachable from this session) with modelled gear, exported as Draco-compressed glTF; a Cessna 208 Caravan with a roll-up door for version one, per-DZ aircraft (Twin Otter, Pilatus Porter) later. If a convincing model cannot be produced in time, the first-person view carries version one and the third-person model is the first thing improved after.
+- **Assets:** a CC0 base human adapted in Blender (Shadi's Blender is reachable from this session when it is running) with modelled gear, exported as Draco-compressed glTF; a Cessna 208 Caravan with a roll-up door for version one, per-DZ aircraft (Twin Otter, Pilatus Porter) later. The asset track is owned by Claude, not MiniMax, and starts at milestone 2 in parallel with the world, because the first-person arms, the guide and the replay all need the same model; it gets a look check by Shadi on his phone before milestone 7. If the model does not pass that check, the guide ships switched off by default with a note, first-person carries version one, and the model is the first thing improved after. **[Claude]**
 - **Canopy:** a ram-air mesh with top and bottom skin, nine cells (seven for the reserve), cell bulge, brake and riser deformation, three line cascades, slider, pilot chute and bridle; the opening sequence drives inflation from the phase variable.
 - **Effects and post:** ACES tone mapping, no bloom on phones, subtle vignette, a speed shake, lens dirt off by default. Shadows: only the jumper's contact shadow near the ground.
 - **Sound:** procedural wind (filtered noise shaped by airspeed and body position, different under canopy), engine note on the climb, the exit roar transition, audible beeps, the opening (flutter, snap, silence), canopy fabric on brake input, line hum, distant ground ambience, the guide's whoop, footsteps or a slide at landing. Spatialised for the guide's position.
@@ -277,12 +280,14 @@ Exact drop-zone coordinates and polygons (verify on the imagery), tile zoom thre
 
 ## 15. Milestones (for the plan)
 
-1. Scaffold, tests, CI, GitHub Pages deploy of a blank page.
-2. The world at Interlaken: terrain, imagery, sky, a free camera, performance on a phone.
-3. Simulation core and belly freefall in first-person with the altimeter and audible, from the hill to the pull, against the target tests.
-4. Opening, canopy, flare, landing outcomes, debrief.
-5. Manifest, climb, jump run and spot, drop-zone list and search, prefetch and offline.
+1. Scaffold, tests, CI, deploy of a blank page to the chosen host, the old game moved to `legacy/`.
+2. The world at Interlaken: terrain, imagery, sky, a free camera, performance on a phone. The asset track starts here.
+3. Simulation core and belly freefall in first-person with the altimeter and audible, from the hill to the pull, against the target tests. Tilt and touch controls come in here so they get device time early.
+4. Opening, canopy, flare, landing outcomes, debrief. **First private playable:** a link for Shadi only, a full belly jump at Interlaken on his phone.
+5. Manifest with live conditions and the profile, climb, jump run and spot, drop-zone list and search, landing-area adjuster, prefetch and offline.
 6. Tracking suit and wingsuit.
-7. The guide.
-8. Third-person, replay, share card, sound polish, PWA, performance tiers.
-9. Play-testing and tuning with the friends' feedback.
+7. The guide (ships on by default only if the model passed its look check).
+8. Third-person, replay, share card, sound polish, PWA, performance tiers. **The friends' link goes out at the end of this milestone**, unless Shadi decides to send it earlier.
+9. Play-testing and tuning with the friends' feedback, and the drop-zone polygons they confirm.
+
+There is no deadline and no spend ceiling; the pace is set by quality, and MiniMax runs are kept small, single-purpose and reviewed so spend stays sensible. **[Shadi]** Each milestone ends with a short device pass by Shadi on his own phones before the next one starts; what he finds is folded into the next milestone's briefs. Prefetch is split so the near field (what the landing needs) loads before the first jump and the rest finishes during the climb, which keeps the 20-second target without shrinking the 40 MB drop zone.

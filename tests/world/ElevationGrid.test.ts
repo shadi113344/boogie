@@ -7,7 +7,9 @@ import {
   mercatorToLonLat,
   metersPerPixel,
   tileBoundsMercator,
+  tileKey,
 } from '@/world/geo';
+import type { TileCoord } from '@/world/geo';
 import { TERRARIUM_TILE_SIZE } from '@/world/terrarium';
 
 const TILE = TERRARIUM_TILE_SIZE;
@@ -219,5 +221,86 @@ describe('ElevationGrid', () => {
     // from the tile the point is in.
     expect([...zooms]).toEqual([14]);
     expect(worst).toBe(0);
+  });
+
+  it('keeps 192 height tiles by default', () => {
+    const g = new ElevationGrid(frame);
+
+    // One array for all of them: the test is about the number of tiles the
+    // grid keeps, not about the heights in them.
+    const heights = flatTile(100);
+    for (let i = 0; i < 200; i++) {
+      g.addTile({ z: 14, x: i, y: 0 }, heights);
+    }
+
+    expect(g.tileCount()).toBe(192);
+  });
+
+  it('throws the least recently used tile away when it runs out of room', () => {
+    const evicted: TileCoord[] = [];
+    const g = new ElevationGrid(frame, {
+      maxTiles: 192,
+      onEvict: (t) => evicted.push(t),
+    });
+
+    const heights = flatTile(100);
+    for (let i = 0; i < 200; i++) {
+      g.addTile({ z: 14, x: i, y: 0 }, heights);
+    }
+
+    // The first eight tiles are the ones that have been out of the way the
+    // longest, so they are the ones that go.
+    expect(g.tileCount()).toBe(192);
+    expect(evicted.length).toBe(8);
+    expect(evicted.map(tileKey)).toEqual([
+      '14/0/0',
+      '14/1/0',
+      '14/2/0',
+      '14/3/0',
+      '14/4/0',
+      '14/5/0',
+      '14/6/0',
+      '14/7/0',
+    ]);
+    expect(g.hasTile({ z: 14, x: 0, y: 0 })).toBe(false);
+    expect(g.hasTile({ z: 14, x: 7, y: 0 })).toBe(false);
+    expect(g.hasTile({ z: 14, x: 8, y: 0 })).toBe(true);
+    expect(g.hasTile({ z: 14, x: 199, y: 0 })).toBe(true);
+  });
+
+  it('keeps a tile that has been sampled from being the next one thrown away', () => {
+    const g = new ElevationGrid(frame, { maxTiles: 2 });
+
+    const home = lonLatToTile(ORIGIN, 14);
+    const east = { z: 14, x: home.x + 1, y: home.y };
+    const west = { z: 14, x: home.x - 1, y: home.y };
+
+    g.addTile(home, flatTile(100));
+    g.addTile(east, flatTile(200));
+
+    // The ground under the origin is asked for, so the tile that holds it is
+    // the one that is in use.
+    expect(g.sample(ORIGIN)?.height).toBe(100);
+
+    // The next tile to arrive pushes the east tile out, not the home tile.
+    g.addTile(west, flatTile(300));
+
+    expect(g.tileCount()).toBe(2);
+    expect(g.hasTile(home)).toBe(true);
+    expect(g.hasTile(east)).toBe(false);
+    expect(g.hasTile(west)).toBe(true);
+  });
+
+  it('tells the caller which tile it has thrown away', () => {
+    const evicted: TileCoord[] = [];
+    const g = new ElevationGrid(frame, { maxTiles: 1 });
+    g.onEvict = (t) => evicted.push(t);
+
+    const first = { z: 14, x: 3, y: 4 };
+    g.addTile(first, flatTile(100));
+    g.addTile({ z: 14, x: 5, y: 6 }, flatTile(200));
+
+    expect(evicted).toEqual([first]);
+    expect(g.hasTile(first)).toBe(false);
   });
 });

@@ -3,8 +3,12 @@
  *
  * The grid keeps decoded height tiles in memory, keyed by tile, and answers
  * height queries by sampling the finest tile that is loaded at the point.
- * Heights are metres above mean sea level. This module imports nothing from
- * three.js or the DOM.
+ * Heights are metres above mean sea level. The tiles are held in the order
+ * they were last used, and the ones that have been out of the way the
+ * longest are thrown away when the grid runs out of room, so a long flight
+ * cannot fill the phone with heights it will never look at again.
+ *
+ * This module imports nothing from three.js or the DOM.
  */
 
 import { curvatureDrop, lonLatToMercator, tileBoundsMercator, tileKey, EARTH_RADIUS } from './geo';
@@ -13,6 +17,14 @@ import { TERRARIUM_TILE_SIZE } from './terrarium';
 
 /** Default zoom of the elevation tiles: ~6 m per pixel at Interlaken. */
 const DEFAULT_MAX_ZOOM = 14;
+
+/**
+ * Default number of height tiles kept in memory.
+ *
+ * A tile is 256 KB of floats, so this is about 48 MB: enough for the ground
+ * around the drop zone, little enough to keep the phone happy.
+ */
+const DEFAULT_MAX_TILES = 192;
 
 /** Edge length of a tile in pixels; row 0 is the north edge. */
 const TILE = TERRARIUM_TILE_SIZE;
@@ -34,12 +46,40 @@ interface MercatorBounds {
   maxY: number;
 }
 
+/** One loaded height tile and the tile it belongs to. */
+interface ElevationTile {
+  coord: TileCoord;
+  heights: Float32Array;
+}
+
+/** How the grid is allowed to look. Every field has a default. */
+export interface ElevationGridOptions {
+  /** Finest zoom of the elevation tiles. Default 14. */
+  maxZoom?: number;
+  /** Height tiles kept in memory; the least recently used one is thrown away. Default 192. */
+  maxTiles?: number;
+  /** Called with every tile that is thrown away. */
+  onEvict?: (t: TileCoord) => void;
+}
+
 export class ElevationGrid {
   readonly maxZoom: number;
 
+  /**
+   * Called with every tile that is thrown away.
+   *
+   * The caller needs to know: a tile that is gone is not in the grid any
+   * more, so whatever it knew about it is stale.
+   */
+  onEvict?: (t: TileCoord) => void;
+
   private readonly frame: LocalFrame;
 
-  private readonly tiles = new Map<string, Float32Array>();
+  /** The height tiles in memory, oldest first: the eviction order. */
+  private readonly tiles = new Map<string, ElevationTile>();
+
+  /** How many height tiles are kept in memory. */
+  private readonly maxTiles: number;
 
   /** The tile that answered the last sample. */
   private lastTile: TileCoord | null = null;
@@ -50,9 +90,11 @@ export class ElevationGrid {
   /** The zoom of the finest tile in the grid, -1 while it is empty. */
   private finestZoom = -1;
 
-  constructor(frame: LocalFrame, opts?: { maxZoom?: number }) {
+  constructor(frame: LocalFrame, opts?: ElevationGridOptions) {
     this.frame = frame;
     this.maxZoom = opts?.maxZoom ?? DEFAULT_MAX_ZOOM;
+    this.maxTiles = Math.max(1, opts?.maxTiles ?? DEFAULT_MAX_TILES);
+    this.onEvict = opts?.onEvict;
   }
 
   /** Store the heights of one tile; row 0 is the north edge. */
@@ -61,13 +103,65 @@ export class ElevationGrid {
     if (heights.length !== expected) {
       throw new RangeError(`elevation tile ${tileKey(t)} must hold ${expected} heights, got ${heights.length}`);
     }
-    this.tiles.set(tileKey(t), heights);
+    const key = tileKey(t);
+    // The tile is stored at the end of the order: it is the most recently
+    // used one now.
+    this.tiles.delete(key);
+    this.tiles.set(key, { coord: t, heights });
     if (t.z > this.finestZoom && t.z <= this.maxZoom) this.finestZoom = t.z;
 
     // A tile that has just arrived may cover the point of the last sample
     // more finely, so the remembered tile is dropped.
     this.lastTile = null;
     this.lastBounds = null;
+
+    this.enforceBudget();
+  }
+
+  /**
+   * Keep the number of height tiles within the budget.
+   *
+   * The least recently used tile goes first: it is the one that has been
+   * out of the way the longest, so it is the one the ground is least likely
+   * to need again. The caller is told, because a tile that is gone is not in
+   * the grid any more.
+   */
+  private enforceBudget(): void {
+    while (this.tiles.size > this.maxTiles) {
+      const oldest = this.tiles.keys().next();
+      if (oldest.done) break;
+      const key = oldest.value;
+      const entry = this.tiles.get(key);
+      this.tiles.delete(key);
+      if (!entry) continue;
+
+      // The remembered tile may be the one that has just gone.
+      if (this.lastTile && tileKey(this.lastTile) === key) {
+        this.lastTile = null;
+        this.lastBounds = null;
+      }
+      if (entry.coord.z === this.finestZoom) this.recomputeFinestZoom();
+
+      this.onEvict?.(entry.coord);
+    }
+  }
+
+  /** The zoom of the finest tile left in the grid. */
+  private recomputeFinestZoom(): void {
+    let finest = -1;
+    for (const tile of this.tiles.values()) {
+      if (tile.coord.z > finest && tile.coord.z <= this.maxZoom) finest = tile.coord.z;
+    }
+    this.finestZoom = finest;
+  }
+
+  /** Move a tile to the most recently used end of the eviction order. */
+  private touch(t: TileCoord): void {
+    const key = tileKey(t);
+    const entry = this.tiles.get(key);
+    if (!entry) return;
+    this.tiles.delete(key);
+    this.tiles.set(key, entry);
   }
 
   hasTile(t: TileCoord): boolean {
@@ -129,6 +223,9 @@ export class ElevationGrid {
     const cached = this.lastTile;
     const bounds = this.lastBounds;
     if (cached && bounds && cached.z === this.finestZoom && covers(bounds, m)) {
+      // The tile that answers is the tile that is in use: it moves to the
+      // end of the eviction order.
+      this.touch(cached);
       return cached;
     }
 
@@ -138,6 +235,7 @@ export class ElevationGrid {
       const tile: TileCoord = { z, x: top.x >> shift, y: top.y >> shift };
       if (!this.hasTile(tile)) continue;
       this.remember(tile);
+      this.touch(tile);
       return tile;
     }
     return null;
@@ -159,8 +257,9 @@ export class ElevationGrid {
    * (i + 0.5) / 256, hence the half pixel shift and the clamp to the tile.
    */
   private heightIn(t: TileCoord, m: MercatorPoint): number {
-    const heights = this.tiles.get(tileKey(t));
-    if (!heights) return 0;
+    const entry = this.tiles.get(tileKey(t));
+    if (!entry) return 0;
+    const heights = entry.heights;
 
     const b = tileBoundsMercator(t);
     const span = b.maxX - b.minX;

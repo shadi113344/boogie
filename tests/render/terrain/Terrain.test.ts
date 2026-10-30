@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Group, Texture } from 'three';
-import { LocalFrame, parentTile, tileKey } from '@/world/geo';
+import { LocalFrame, lonLatToTile, parentTile, tileKey } from '@/world/geo';
 import type { TileCoord } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
-import { TileCache } from '@/world/TileCache';
+import { TileCache, TileFetchError } from '@/world/TileCache';
 import { imageryProviderForZoom, tileUrl } from '@/world/providers';
 import type { Atmosphere } from '@/render/Atmosphere';
 import { Terrain } from '@/render/terrain/Terrain';
@@ -76,6 +76,8 @@ function makeCache(
     hangImageZoom?: number;
     holdElevationZoom?: number;
     holdElevationAbove?: number;
+    concurrency?: number;
+    hangImageFetch?: boolean;
   } = {},
 ): CacheFixture {
   const fetched: string[] = [];
@@ -94,6 +96,11 @@ function makeCache(
   const fetchFn = async (input: RequestInfo | URL): Promise<Response> => {
     const url = String(input);
     fetched.push(url);
+    if (opts.hangImageFetch && !isElevation(url)) {
+      // Never arrives: the request stays on the wire and takes a slot of the
+      // cache for good.
+      await new Promise<never>(() => {});
+    }
     return new Response(url, { status: 200 });
   };
 
@@ -121,7 +128,7 @@ function makeCache(
     decodeImage,
     decodePixels,
     // Plenty of room, so a tile that never arrives does not hold up the rest.
-    concurrency: 512,
+    concurrency: opts.concurrency ?? 512,
   });
 
   return { cache, fetched, releaseElevation: () => releaseElevation() };
@@ -139,6 +146,7 @@ async function settle(cache: TileCache): Promise<void> {
 interface Fixture extends CacheFixture {
   terrain: Terrain;
   world: Group;
+  elevation: ElevationGrid;
 }
 
 /** A terrain over a fake world, streaming into the given cache. */
@@ -148,16 +156,17 @@ function makeTerrain(
     maxVisibleTiles?: number;
     maxBuildsPerUpdate?: number;
     disposeDelayMs?: number;
+    elevationMaxTiles?: number;
   } = {},
 ): Fixture {
   const world = new Group();
-  const elevation = new ElevationGrid(frame);
+  const elevation = new ElevationGrid(frame, { maxTiles: opts.elevationMaxTiles });
   const terrain = new Terrain(world, frame, lz, elevation, cacheFixture.cache, atmo, {
     maxVisibleTiles: opts.maxVisibleTiles ?? 60,
     maxBuildsPerUpdate: opts.maxBuildsPerUpdate,
     disposeDelayMs: opts.disposeDelayMs,
   });
-  return { ...cacheFixture, terrain, world };
+  return { ...cacheFixture, terrain, world, elevation };
 }
 
 /**
@@ -394,6 +403,23 @@ describe('Terrain', () => {
     dispose.mockRestore();
   });
 
+  it('disposes unused textures when the texture budget is lowered', async () => {
+    const dispose = vi.spyOn(Texture.prototype, 'dispose');
+    const fixture = makeTerrain(makeCache(), { maxBuildsPerUpdate: 0 });
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The textures are there, and none of them is on screen.
+    expect(dispose).not.toHaveBeenCalled();
+
+    fixture.terrain.setMaxTextures(0);
+
+    expect(dispose).toHaveBeenCalled();
+
+    dispose.mockRestore();
+  });
+
   it('disposes an unused texture when the cache evicts it', async () => {
     const dispose = vi.spyOn(Texture.prototype, 'dispose');
     const fixture = makeTerrain(makeCache(), { maxBuildsPerUpdate: 0 });
@@ -413,5 +439,128 @@ describe('Terrain', () => {
     expect(dispose).toHaveBeenCalled();
 
     dispose.mockRestore();
+  });
+
+  it('asks for no imagery until the elevation it is draped on has arrived', async () => {
+    const fixture = makeTerrain(makeCache({ holdElevationZoom: 14 }), { maxVisibleTiles: 400 });
+
+    // From high above the drop zone the selection is the root ring, and the
+    // elevation of that ring is coarse but enough to know the ground.
+    fixture.terrain.update(cameraAt(0, 700_000, 0));
+    await settle(fixture.cache);
+
+    // The camera comes down: the selection refines to the fine tiles, but the
+    // elevation they are draped on is still on its way, so the imagery of
+    // that zoom is not asked for.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    const leaves = fixture.terrain['desiredTiles'];
+    expect(leaves.some((tile: TileCoord) => tile.z === 16)).toBe(true);
+    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16)).toBe(false);
+
+    // The fine elevation arrives, and the imagery follows it.
+    fixture.releaseElevation();
+    await settle(fixture.cache);
+
+    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16)).toBe(true);
+  });
+
+  it('cancels the imagery it no longer wants', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fixture = makeTerrain(makeCache({ concurrency: 1, hangImageFetch: true }));
+
+    // The requests that the cache dropped, and the ones it never sent.
+    const cancelled = new Set<string>();
+    const getImage = fixture.cache.getImage.bind(fixture.cache);
+    fixture.cache.getImage = (url: string, priority = 0): Promise<ImageBitmap> => {
+      const promise = getImage(url, priority);
+      void promise.catch((error: unknown) => {
+        if (error instanceof TileFetchError && error.status === -1) cancelled.add(url);
+      });
+      return promise;
+    };
+
+    // The camera looks at the ground: the imagery of the leaves is asked for.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The camera moves twenty kilometres east: the leaves are other tiles now.
+    fixture.terrain.update(cameraAt(20_000, 4683, 0));
+    await settle(fixture.cache);
+
+    // The imagery of the first set was dropped before it was ever sent.
+    expect(cancelled.size).toBeGreaterThan(0);
+    for (const url of cancelled) {
+      expect(fixture.fetched).not.toContain(url);
+    }
+
+    // A cancelled request is not a failure, and it is not worth a warning.
+    expect(fixture.terrain['failed'].size).toBe(0);
+    expect(warn).not.toHaveBeenCalled();
+
+    warn.mockRestore();
+  });
+
+  it('asks for an elevation tile again after the grid has thrown it away', async () => {
+    const fixture = makeTerrain(makeCache(), { elevationMaxTiles: 4 });
+
+    // One tile of the root ring is enough for this test.
+    fixture.terrain.quadtree.config.rootRadiusM = 1000;
+
+    const asked: string[] = [];
+    const getHeights = fixture.cache.getHeights.bind(fixture.cache);
+    fixture.cache.getHeights = (url: string, priority = 0): Promise<Float32Array> => {
+      asked.push(url);
+      return getHeights(url, priority);
+    };
+
+    // From high above the ground the selection is the root ring.
+    fixture.terrain.update(cameraAt(0, 700_000, 0));
+    await settle(fixture.cache);
+
+    const root = lonLatToTile(frame.origin, 8);
+    const first = asked.filter((url) => isElevation(url) && url.includes(`/${root.z}/${root.x}/${root.y}`));
+    expect(first.length).toBe(1);
+
+    // The grid fills up and throws the elevation tile away.
+    const heights = new Float32Array(TILE_SIZE * TILE_SIZE).fill(100);
+    for (let i = 0; i < 5; i++) {
+      fixture.elevation.addTile({ z: 12, x: i, y: 4000 }, heights);
+    }
+    expect(fixture.elevation.hasTile(root)).toBe(false);
+
+    // The terrain has forgotten the height range of the tile as well.
+    expect(fixture.terrain['elevationRanges'].has(tileKey(root))).toBe(false);
+
+    // The next update asks for the tile again.
+    fixture.terrain.update(cameraAt(0, 700_000, 0));
+    await settle(fixture.cache);
+
+    expect(asked.filter((url) => url === first[0]).length).toBe(2);
+  });
+
+  it('does not ask for an elevation tile the grid already holds', async () => {
+    const fixture = makeTerrain(makeCache(), { elevationMaxTiles: 4 });
+
+    // One tile of the root ring is enough for this test.
+    fixture.terrain.quadtree.config.rootRadiusM = 1000;
+
+    const asked: string[] = [];
+    const getHeights = fixture.cache.getHeights.bind(fixture.cache);
+    fixture.cache.getHeights = (url: string, priority = 0): Promise<Float32Array> => {
+      asked.push(url);
+      return getHeights(url, priority);
+    };
+
+    // The grid holds the tile of the root ring already, so the terrain has
+    // no reason to ask for it.
+    const root = lonLatToTile(frame.origin, 8);
+    fixture.elevation.addTile(root, new Float32Array(TILE_SIZE * TILE_SIZE).fill(568));
+
+    fixture.terrain.update(cameraAt(0, 700_000, 0));
+    await settle(fixture.cache);
+
+    expect(asked.filter((url) => isElevation(url))).toEqual([]);
   });
 });

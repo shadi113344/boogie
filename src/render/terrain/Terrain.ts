@@ -20,6 +20,7 @@ import * as THREE from 'three';
 import { parentTile, tileKey } from '../../world/geo';
 import type { LocalFrame, TileCoord } from '../../world/geo';
 import type { ElevationGrid } from '../../world/ElevationGrid';
+import { TileFetchError } from '../../world/TileCache';
 import type { TileCache } from '../../world/TileCache';
 import { ELEVATION_PROVIDER, imageryProviderForZoom, tileUrl } from '../../world/providers';
 import type { Atmosphere } from '../Atmosphere';
@@ -163,6 +164,15 @@ export class Terrain {
     cache.onEvict = (url: string): void => {
       this.onEvict(url);
     };
+
+    // The grid throws its tiles away when it runs out of room. The terrain
+    // has to forget the height range of a tile that is gone, or the ground
+    // stays known at a zoom that is no longer there.
+    const gridOnEvict = this.elevation.onEvict;
+    this.elevation.onEvict = (t: TileCoord): void => {
+      this.elevationRanges.delete(tileKey(t));
+      gridOnEvict?.(t);
+    };
   }
 
   /**
@@ -183,8 +193,54 @@ export class Terrain {
       this.distances.set(tileKey(coord), this.distanceTo(cam, coord));
     }
 
+    // The camera has moved on: the imagery of the tiles that are no longer
+    // wanted is thrown away before the new requests go out.
+    this.cancelUnwantedImagery();
+
     this.requestMissing(cam, now);
     this.refreshVisible(now);
+  }
+
+  /**
+   * Cancel the imagery that is no longer wanted.
+   *
+   * The wanted set is the imagery of every leaf of the selection and of the
+   * ancestors that stand in for them. Anything else that is still on its way
+   * is cancelled: the camera has moved on, and the tile would only take a
+   * slot in the queue and a texture on the GPU.
+   *
+   * Only the queued requests can be cancelled; one that is already on the
+   * wire is left to arrive, and it is simply not asked for again.
+   */
+  private cancelUnwantedImagery(): void {
+    const wanted = this.wantedImageryUrls();
+    for (const [url, kind] of [...this.pending]) {
+      if (kind !== 'image') continue;
+      if (wanted.has(url)) continue;
+      this.cache.cancel(url);
+    }
+  }
+
+  /** The imagery the current selection wants: its leaves and their ancestors. */
+  private wantedImageryUrls(): Set<string> {
+    const wanted = new Set<string>();
+    const rootZoom = this.quadtree.config.rootZoom;
+
+    // The ancestors are collected first: many leaves share them, and a URL is
+    // not cheap to build.
+    const ancestors = new Map<string, TileCoord>();
+    for (const coord of this.desiredTiles) {
+      wanted.add(this.imageryUrlFor(coord));
+      let ancestor = parentTile(coord);
+      while (ancestor && ancestor.z >= rootZoom) {
+        ancestors.set(tileKey(ancestor), ancestor);
+        ancestor = parentTile(ancestor);
+      }
+    }
+    for (const ancestor of ancestors.values()) {
+      wanted.add(this.imageryUrlFor(ancestor));
+    }
+    return wanted;
   }
 
   /**
@@ -222,22 +278,40 @@ export class Terrain {
    * few, so the ground is known one round trip later and the imagery can
    * follow. The fallback of such a tile waits as well, for the same reason:
    * the parent is only worth asking for once the ground is there.
+   *
+   * "Known" means the elevation tile the imagery is draped on, not just any
+   * elevation tile that covers it: a coarse tile says nothing about how fine
+   * the selection is going to be, and the imagery of a zoom that is about to
+   * change is imagery thrown away.
    */
   private requestMissing(cam: LodCamera, now: number): void {
     const nearest = this.nearestFirst();
 
     for (const coord of nearest) {
       this.requestElevation(coord, cam, now);
-      if (!this.coveringElevation(coord)) continue;
+      if (!this.elevationReady(coord)) continue;
       this.requestImagery(coord, cam, now);
     }
 
     // The parent of every leaf, so a leaf that is not ready has something to
     // fall back on while its own imagery is still on the way.
     for (const coord of nearest) {
-      if (!this.coveringElevation(coord)) continue;
+      if (!this.elevationReady(coord)) continue;
       this.requestFallback(coord, cam, now);
     }
+  }
+
+  /**
+   * Whether the ground under a tile is known finely enough to draw it.
+   *
+   * The imagery of a tile is draped on the elevation tile of the same zoom,
+   * capped at the finest zoom of the elevation: the zoom-14 tile for every
+   * tile of zoom 14 and finer, the tile's own zoom below that. Until that
+   * tile has arrived the tile is not asked for, because the selection it
+   * would be drawn at is not settled yet.
+   */
+  private elevationReady(coord: TileCoord): boolean {
+    return this.elevation.hasTile(this.elevation.elevationTileFor(coord));
   }
 
   /**
@@ -321,6 +395,17 @@ export class Terrain {
     }
   }
 
+  /**
+   * How many imagery textures are kept on the GPU at once.
+   *
+   * A lower budget throws the textures that are not on screen away at once,
+   * so the memory of the GPU is freed when the tier steps down.
+   */
+  setMaxTextures(maxTextures: number): void {
+    this.options.maxTextures = maxTextures;
+    this.enforceTextureBudget();
+  }
+
   /** Let go of everything: the meshes, the textures and the requests. */
   dispose(): void {
     for (const state of this.tiles.values()) {
@@ -370,6 +455,10 @@ export class Terrain {
       },
       (error: unknown) => {
         this.pending.delete(url);
+        // A request that was cancelled is not a failure: the tile was not
+        // wanted any more, so there is nothing to warn about and nothing to
+        // remember.
+        if (isCancelled(error)) return;
         this.failed.set(url, Date.now());
         console.warn(`boogie: no imagery for ${url}`, error);
       },
@@ -380,10 +469,9 @@ export class Terrain {
   private requestElevation(coord: TileCoord, cam: LodCamera, now: number): void {
     const elev = this.elevation.elevationTileFor(coord);
 
-    // The ranges are what the terrain knows: a tile whose range is known does
-    // not have to be asked for again, even when the cache has thrown the
-    // heights away in the meantime.
-    if (this.elevationRanges.has(tileKey(elev))) return;
+    // The grid is what the terrain knows: a tile that has been thrown away
+    // is asked for again, or the ground under it would stay unknown.
+    if (this.elevation.hasTile(elev)) return;
 
     const url = tileUrl(ELEVATION_PROVIDER, elev);
     if (this.pending.has(url)) return;
@@ -416,7 +504,10 @@ export class Terrain {
    *
    * The elevation of the ancestor is always asked for: it is what tells the
    * terrain how high the ground is under the tile that is still on its way.
-   * The imagery of the ancestor waits for that ground.
+   * The imagery of the ancestor waits for that ground: the ancestor is
+   * draped on the elevation tile of its own zoom, so the imagery of a
+   * fallback waits for the elevation of that zoom and not for any tile that
+   * happens to cover it.
    */
   private requestFallback(leaf: TileCoord, cam: LodCamera, now: number): void {
     const rootZoom = this.quadtree.config.rootZoom;
@@ -429,7 +520,7 @@ export class Terrain {
       const failedAt = this.failed.get(url);
       if (failedAt === undefined || now - failedAt >= RETRY_AFTER_MS) {
         this.requestElevation(ancestor, cam, now);
-        if (this.coveringElevation(ancestor)) this.requestImagery(ancestor, cam, now);
+        if (this.elevationReady(ancestor)) this.requestImagery(ancestor, cam, now);
         return;
       }
       ancestor = parentTile(ancestor);
@@ -676,4 +767,15 @@ export class Terrain {
 /** Whether two boxes in the local frame overlap. */
 function overlaps(a: TileBounds, b: TileBounds): boolean {
   return a.minX <= b.maxX && a.maxX >= b.minX && a.minZ <= b.maxZ && a.maxZ >= b.minZ;
+}
+
+/**
+ * Whether a tile request was cancelled rather than failed.
+ *
+ * A cancelled request is one the terrain asked the cache to drop because
+ * the tile was not wanted any more. It never reached the network, so it is
+ * neither a failure nor a reason to warn.
+ */
+function isCancelled(error: unknown): boolean {
+  return error instanceof TileFetchError && error.status === -1;
 }

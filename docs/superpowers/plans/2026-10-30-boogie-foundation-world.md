@@ -628,3 +628,22 @@ it('findDropZone returns undefined for unknown ids', () => { expect(findDropZone
 - Names used across tasks match: `LocalFrame`, `TileCoord`, `tileKey`, `parentTile`, `childTiles`, `metersPerPixel`, `curvatureDrop`, `TileCache.getImage/getHeights/onEvict`, `ElevationGrid.sample/sampleLocal/groundY/elevationTileFor`, `Atmosphere.applyTo/setSun/setCameraY`, `AppOptions`, `TerrainTile.setTexture/rebuildHeights/ready/elevZoom`, `TerrainQuadtree.select/inView`, `computeRenderSet`, `LodCamera.focalPx/dir/halfAngleRad`, `Terrain.update/setTau/setAnisotropy/stats`, `FloatingOrigin.update/truePosition`, `AdaptiveQuality.pushFrame`, `FreeCamera.setPose/update/agl`, `DropZone`.
 - Budget check done by hand: with the view cone, a phone at pixel ratio 2 looking down from exit altitude selects roughly 110 zoom-16 tiles and 110 zoom-15 tiles in view plus a coarse ring behind, under 300 draw calls after frustum culling and about 100 MB of tile textures; the `maxLeaves` rule is the backstop for larger screens.
 - Review Focus lines each have a test in the owning task (Task 5 caches-undefined and 404; Task 9 fallback; Task 3 Gryttjom; Tasks 4 and 6 negative and missing heights; Task 11 ground clamp and tier step-down).
+
+## Execution notes and milestone 2 findings (2026-10-30)
+
+All twelve tasks landed on `main` the same day, each as one MiniMax run reviewed and tested by the orchestrator, plus four follow-ups the review and the browser measurements called for: 9b (best-first refinement replaced the tau relaxation), 10b (imagery gated on elevation, paced mesh builds, faster ground sampling, debug handle), 10c (imagery gated on the finest elevation tile, cancellation of stale requests, a 192-tile cap on the elevation grid) and 10d (the fallback walk continues past ancestors whose elevation is not ready, so the coarse ring shows first). The live page is https://shadi113344.github.io/boogie/ and `?debug=1` adds the overlay, the three camera buttons and `window.__boogie`.
+
+Measured in the desktop app's browser pane (Intel Iris Xe, 1024×768, pixel ratio 1), which caps animation frames at 30 per second and is therefore not a frame-rate instrument:
+
+- Interlaken from 13,500 ft: 139 to 334 leaves depending on window size, 31 to 119 draw calls after frustum culling, 68 k to 246 k triangles, `terrain.update` 0.9 to 1.7 ms per frame, no holes and no console errors at Interlaken, Dubai and Gryttjom.
+- Cold start on a fresh drop zone: about 640 requests (imagery, fallback ancestors and up to 192 elevation tiles) at 8 in flight with 70 to 900 ms latency, so first-sharp takes about 30 s; the coarse ring must appear within about 2 s (10d). Elevation alone is up to 192 PNGs of about 100 KB, because elevation is requested for every transient leaf while the selection settles.
+- The adaptive quality stepped down to the low tier in the pane because 33 ms frames exceed the fixed 20 ms threshold; on a 60 Hz phone this does not happen, but the rule should compare against the display's own refresh interval and ignore the loading burst.
+- `update ms` on the overlay reads 0.0 (the moving average resets before it is read); the value is correct on `window.__boogie.updateMsAvg`.
+
+Carried into Plan 2 (milestones 3 and 4), in priority order:
+
+1. Top-down elevation: treat a tile with an unknown height range as a leaf until its elevation arrives instead of assuming 0 to 5,000 m, so the selection refines progressively and elevation requests are bounded by the final selection (today up to 192 tiles and about 20 MB on a cold start).
+2. Adaptive quality against the measured refresh interval, with adaptation held while tiles are still being built.
+3. Prefetch of the landing-area cone and the jump run before exit (milestone 5 in the spec, but the cold-start numbers argue for doing the landing-area part earlier).
+4. The overlay's `update ms` line; the exit button follows the drop zone's `exitAltitudeFt`.
+5. Phone pass on the iPhone and the Android: frame rate per tier, tile pops, landing-area placement at all six drop zones; the pane cannot measure these.

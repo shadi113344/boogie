@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isaDensity } from '@/sim/atmosphere';
 import { BELLY } from '@/sim/freefall/aero';
 import { DEFAULT_JUMPER, exitMassKg } from '@/sim/jumper';
-import { Opening, OPENING, planOpening, type OpeningPlan, type OpeningStage } from '@/sim/opening';
+import { Opening, OPENING, OPENING_CANOPY_DRAG_M2, planOpening, type OpeningPlan, type OpeningStage } from '@/sim/opening';
 import { Rng } from '@/sim/rng';
 import { FT, G, MPH } from '@/sim/units';
 
@@ -29,7 +29,7 @@ const THROW_ABOVE_LZ_FT = 3500;
 const START_ALTITUDE_M = LZ_ELEVATION_M + THROW_ABOVE_LZ_FT * FT;
 
 /** The canopy's flight force, stood in for by a drag area, in square metres. */
-const CANOPY_FLIGHT_AREA_M2 = 9.5;
+const CANOPY_FLIGHT_AREA_M2 = OPENING_CANOPY_DRAG_M2;
 
 /** The step of the simulation, in seconds. */
 const DT = 1 / 120;

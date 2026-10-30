@@ -110,6 +110,17 @@ export const OPENING_DRAG = {
   handoverPow: 2.4,
 };
 
+/**
+ * The drag area the canopy's own flight force stands in for, in square metres.
+ *
+ * Through the inflation the cloth leaves the jumper's drag and the canopy's
+ * own flight force takes over, and this is the area that force is worth
+ * while the jumper is still moving with the opening. The opening inside the
+ * jump (task 14) uses the same number, so that the load of the opening is
+ * the one this module was tuned against.
+ */
+export const OPENING_CANOPY_DRAG_M2 = 9.5;
+
 /** Keeps a number inside a range. */
 function clamp(value: number, low: number, high: number): number {
   return Math.min(Math.max(value, low), high);

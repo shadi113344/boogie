@@ -560,7 +560,7 @@ The timeline from the throw (main): pilot chute hesitation `hesitationS` = U(0.3
   - peak deceleration 2.8 to 5.5 g for every non-hard opening;
   - altitude from the throw to `open` 570 to 945 ft;
   - reserve: `open` within 3.2 s;
-  - at 150 mph vertical more than half of the plans are hard and every hard one peaks above 8 g; at 120 mph none is hard.
+  - at 150 mph vertical between 30 and 70 percent of the plans are hard, at 160 mph all of them, and every hard one peaks above 8 g; at 120 mph none is hard.
 - [ ] **Step 2: Run, fail. Step 3: Implement. Step 4: Run, pass.**
 - [ ] **Step 5: Commit** `feat(sim): opening sequence, hard openings and the reserve opening`
 

@@ -59,6 +59,16 @@ const EMA_ALPHA = 0.1;
 /** A frame slower than this, in milliseconds, is too slow. */
 const DEFAULT_THRESHOLD_MS = 20;
 
+/**
+ * How much over the display's own interval a frame has to be to be slow.
+ *
+ * The threshold follows the display: a phone in Low Power Mode delivers
+ * its frames every 33 ms and that is exactly what it should deliver, so
+ * the frame has to be a quarter longer than the interval before the app
+ * counts as too slow.
+ */
+const REFRESH_TOLERANCE = 1.25;
+
 /** How long the frames have to be too slow, in milliseconds. */
 const DEFAULT_SUSTAIN_MS = 2000;
 
@@ -98,7 +108,10 @@ export class AdaptiveQuality {
   /** When the tier last changed, in frame time. */
   private lastChangeAt = Number.NEGATIVE_INFINITY;
 
-  private readonly thresholdMs: number;
+  /** True while the adaptation is held: the frames are no evidence. */
+  private held = false;
+
+  private thresholdMs: number;
   private readonly sustainMs: number;
   private readonly cooldownMs: number;
 
@@ -115,12 +128,46 @@ export class AdaptiveQuality {
   }
 
   /**
+   * The refresh interval of the display, in milliseconds.
+   *
+   * The threshold becomes a quarter longer than that interval, so a
+   * display that delivers its frames on time is never mistaken for a
+   * slow machine. Until the app has measured the display, the fixed
+   * threshold stands.
+   */
+  setRefreshIntervalMs(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    // A 120 Hz display that the app renders at a steady 60 fps is not a
+    // slow machine: the threshold never asks for more than the fixed one.
+    this.thresholdMs = Math.max(DEFAULT_THRESHOLD_MS, ms * REFRESH_TOLERANCE);
+  }
+
+  /**
+   * Hold the adaptation, or let it go.
+   *
+   * While it is held the frames are no evidence at all: the tier does
+   * not change and the average of the frame times is left alone, so a
+   * burst of slow frames — the loading of the ground, say — is not held
+   * against the tier afterwards. Letting go starts the clock of the slow
+   * frames again.
+   */
+  hold(on: boolean): void {
+    if (on === this.held) return;
+    this.held = on;
+    if (!on) this.slowSince = null;
+  }
+
+  /**
    * One frame of evidence.
    *
    * Returns the new tier when the tier changed, and null when it did not.
    */
   pushFrame(frameMs: number, nowMs: number): QualityTier | null {
     if (this.locked) return null;
+
+    // While the adaptation is held the frames are not evidence: neither
+    // the tier nor the average of the frame times moves.
+    if (this.held) return null;
 
     // The average of the frame times, weighted towards the recent ones.
     this.ema = this.ema === null ? frameMs : this.ema + EMA_ALPHA * (frameMs - this.ema);

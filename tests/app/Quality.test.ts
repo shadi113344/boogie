@@ -92,4 +92,61 @@ describe('quality', () => {
     }
     expect(q.tier).toBe('high');
   });
+
+  it('keeps the fixed threshold until the refresh of the display is known', () => {
+    const q = new AdaptiveQuality('high');
+    for (let t = 0; t <= 2100; t += 16) {
+      q.pushFrame(33, t);
+    }
+    expect(q.tier).toBe('medium');
+  });
+
+  it('follows the refresh of the display: 33 ms frames on a 30 Hz display never step down', () => {
+    const q = new AdaptiveQuality('high');
+    q.setRefreshIntervalMs(33.3);
+    for (let t = 0; t <= 10_000; t += 16) {
+      expect(q.pushFrame(33, t)).toBeNull();
+    }
+    expect(q.tier).toBe('high');
+  });
+
+  it('steps down when the display cannot keep up: 45 ms frames step down after 2 s', () => {
+    const q = new AdaptiveQuality('high');
+    q.setRefreshIntervalMs(33.3);
+    const changed: string[] = [];
+
+    for (let t = 0; t <= 2100; t += 16) {
+      const r = q.pushFrame(45, t);
+      if (r) changed.push(r);
+    }
+    expect(changed).toEqual(['medium']);
+    expect(q.tier).toBe('medium');
+  });
+
+  it('never asks a 120 Hz display for more than the fixed threshold: 60 fps frames keep the tier', () => {
+    const q = new AdaptiveQuality('high');
+    q.setRefreshIntervalMs(8.3);
+    for (let t = 0; t <= 10_000; t += 16) {
+      expect(q.pushFrame(16.7, t)).toBeNull();
+    }
+    expect(q.tier).toBe('high');
+  });
+
+  it('holds the tier while the adaptation is held', () => {
+    const q = new AdaptiveQuality('high');
+    q.setRefreshIntervalMs(33.3);
+    q.hold(true);
+
+    for (let t = 0; t <= 10_000; t += 16) {
+      expect(q.pushFrame(45, t)).toBeNull();
+    }
+    expect(q.tier).toBe('high');
+
+    // The burst that was held was not counted: quick frames keep the tier.
+    q.hold(false);
+    for (let t = 10_016; t <= 20_000; t += 16) {
+      expect(q.pushFrame(33, t)).toBeNull();
+    }
+    expect(q.tier).toBe('high');
+  });
 });

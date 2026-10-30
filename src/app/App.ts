@@ -65,6 +65,19 @@ const EXIT_PITCH_RAD = -Math.PI / 3;
 /** How often the overlay is refreshed, in milliseconds. */
 const HUD_INTERVAL_MS = 100;
 
+/**
+ * The frames the refresh interval of the display is measured over.
+ *
+ * The first frames are the loading of the ground and the first hitch, so
+ * the measurement starts once the app has settled and stops before it has
+ * been running long enough to have met a hitch of its own.
+ */
+const REFRESH_FIRST_FRAME = 30;
+const REFRESH_LAST_FRAME = 90;
+
+/** How many tiles may be on their way before the adaptation waits for them. */
+const PENDING_TILE_LIMIT = 20;
+
 /** The window the mean terrain update time is taken over, in milliseconds. */
 const UPDATE_WINDOW_MS = 1000;
 
@@ -144,6 +157,15 @@ export class App {
 
   /** How long each terrain update took, with the time it happened. */
   private readonly updateSamples: { t: number; ms: number }[] = [];
+
+  /** How many frames have gone by since the app started. */
+  private frameCount = 0;
+
+  /** The intervals of the frames the refresh is measured over, in ms. */
+  private readonly frameIntervals: number[] = [];
+
+  /** True once the refresh of the display has been measured and handed over. */
+  private refreshMeasured = false;
 
   /**
    * The zoom of the elevation the exit pose was placed from, -1 for none.
@@ -266,6 +288,11 @@ export class App {
   }
 
   private frame(dt: number, now: number): void {
+    // The frames are counted from the first one, and the interval of the
+    // display is measured over the frames in the middle of them.
+    this.frameCount += 1;
+    this.measureRefresh(dt);
+
     // The world is rebased first: everything after it works with the camera's
     // true position in the local frame.
     this.floatingOrigin.update(this.camera);
@@ -288,6 +315,9 @@ export class App {
 
     // The tier watches the frame times: a phone that cannot keep up gives
     // up the sharpness of the ground instead of the smoothness of the flight.
+    // The ground that is still on its way is not evidence of a slow machine:
+    // the adaptation waits for the loading to be over.
+    this.quality.hold(this.terrain.stats().pending > PENDING_TILE_LIMIT);
     const changed = this.quality.pushFrame(this.loop.stats().frameMs, now);
     if (changed) this.applyTier(changed);
 
@@ -310,6 +340,26 @@ export class App {
         );
       }
     }
+  }
+
+  /**
+   * Measure the refresh interval of the display and hand it to the tier.
+   *
+   * The interval is the median of the frames from the thirtieth to the
+   * ninetieth: the first frames are the loading of the ground and the last
+   * ones may have met a hitch, and the median of the middle is the honest
+   * number. It is measured once; until it is, the tier keeps its fixed
+   * threshold.
+   */
+  private measureRefresh(dt: number): void {
+    if (this.refreshMeasured) return;
+    if (this.frameCount < REFRESH_FIRST_FRAME) return;
+
+    this.frameIntervals.push(dt * 1000);
+    if (this.frameCount < REFRESH_LAST_FRAME) return;
+
+    this.refreshMeasured = true;
+    this.quality.setRefreshIntervalMs(median(this.frameIntervals));
   }
 
   /**
@@ -507,4 +557,18 @@ export class App {
  */
 function exitAltitudeM(dz: { exitAltitudeFt: number }): number {
   return dz.exitAltitudeFt * 0.3048;
+}
+
+/**
+ * The median of a list of numbers: the middle one, or the mean of the two
+ * middle ones when the count is even.
+ */
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = sorted.length >> 1;
+  if (sorted.length % 2 === 1) return sorted[middle] ?? 0;
+  const lower = sorted[middle - 1] ?? 0;
+  const upper = sorted[middle] ?? 0;
+  return (lower + upper) / 2;
 }

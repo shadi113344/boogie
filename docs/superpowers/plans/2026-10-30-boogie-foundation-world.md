@@ -440,6 +440,7 @@ export interface LodConfig {
   zoomCaps: ZoomCap[];
   viewMarginRad: number;    // 0.35: tiles outside the view cone plus this margin are not refined
   outOfViewMaxZoom: number; // 12
+  outOfViewTauMultiplier: number; // 4: a tile outside the view cone splits only while texelError > tau * this, so the back field stays a few dozen coarse tiles
   maxLeaves: number;        // 400: if select would return more, tau is multiplied by 1.25 and selection repeated, up to four times
 }
 export interface HeightRange { min: number; max: number }
@@ -456,7 +457,7 @@ export class TerrainQuadtree {
 export function computeRenderSet(desired: TileCoord[], isReady: (t: TileCoord) => boolean): TileCoord[]; // for each desired leaf walk up parents until a ready tile; dedupe by key; drop leaves with no ready ancestor
 ```
 
-Why the cone and the cap: at one texel per pixel, a phone looking straight down from 13,500 ft wants zoom 16 out to about 2.5 km and zoom 15 out to about 8.7 km, which is a few hundred tiles in view and several hundred more behind the camera. The cone keeps the back coarse; the cap keeps a 4K desktop or a bad guess inside the 400-tile and 300-draw-call budgets by trading sharpness, never by dropping ground.
+Why the cone, the multiplier and the cap: at one texel per pixel, a phone looking straight down from 13,500 ft wants zoom 16 out to about 2.5 km and zoom 15 out to the edge of the cone, roughly 230 tiles in view; without the multiplier the tiles behind the camera would add several hundred more at zoom 12 (measured 946 in total during implementation), and the 400 cap would then coarsen the tile under the camera to zoom 14. With four texels per pixel allowed behind the camera the back field is about 40 tiles, the whole set about 270, and the cap only ever bites on large desktop screens, trading sharpness, never dropping ground.
 
 - [ ] **Step 1: Write the failing tests** (frame at Interlaken, lz at (0,0), flat heights `{min: 568, max: 568}`; `down = { dir: { x: 0, y: -1, z: 0 }, halfAngleRad: 0.6 }`; `focalPx 1462`, which is a 1,688 px tall render at 60° vertical field of view, an iPhone at pixel ratio 2)
 

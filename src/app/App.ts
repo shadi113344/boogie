@@ -196,6 +196,9 @@ export class App implements JumpHost {
   /** The seed of the jump, and the one of the next jump after it. */
   private nextSeed: number;
 
+  /** The way the jumper is flying, kept for the next jump. */
+  private scheme: ControlScheme = 'tilt';
+
   /** The developer overlay, when the app was started in debug mode. */
   private readonly hud: DebugHud | null = null;
 
@@ -541,6 +544,12 @@ export class App implements JumpHost {
         vspeed: formatSpeed(-jump.velocity().y, units),
         fallRate: session.input.freefall.fallRate.toFixed(2),
         heading: `${((session.headingRad * 180) / Math.PI).toFixed(0)}°`,
+        opening: session.openingStage,
+        maxG: session.maxOpeningG.toFixed(2),
+        brakes: session.brakes,
+        bank: `${session.bankDeg.toFixed(1)}°`,
+        airspeed: formatSpeed(session.airspeedMs, units),
+        sink: formatSpeed(session.sinkMs, units),
       });
       this.jumpLinesShown = true;
     } else if (this.jumpLinesShown) {
@@ -591,6 +600,10 @@ export class App implements JumpHost {
   private startJump(scheme: ControlScheme): void {
     if (this.session) return;
 
+    // The way the jumper flies is remembered: the next jump is flown the
+    // same way, without going back to the start screen.
+    this.scheme = scheme;
+
     void this.ensureAudio().resume();
 
     // The free camera has had its turn: the jumper's eye is in the scene
@@ -616,17 +629,19 @@ export class App implements JumpHost {
     this.startScreen?.show(false);
   }
 
-  /** The jump is over: the session is let go and the start screen comes back. */
+  /**
+   * The jump is over: the session is let go and the next one starts.
+   *
+   * The next jump is a different jump: the seed moves on, and everything
+   * else is what the start screen had: the same drop zone, the same jumper,
+   * the same canopy and the same way of flying. The page is not reloaded.
+   */
   private endJump(): void {
     this.session?.dispose();
     this.session = null;
     // The next jump is a different jump: the seed moves on.
     this.nextSeed = (this.nextSeed + 1) % 0x7fffffff;
-    // The camera goes back to the exit, over the landing area.
-    this.exitSampleZoom = -1;
-    document.querySelector('#vignette')?.setAttribute('hidden', '');
-    this.startScreen?.setLoading(null);
-    this.startScreen?.show(true);
+    this.startJump(this.scheme);
   }
 
   /** Where the world has been rebased to, in metres. */

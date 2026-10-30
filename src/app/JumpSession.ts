@@ -1,10 +1,11 @@
 /**
- * One jump, from the exit to the pull.
+ * One jump, from the exit to the debrief.
  *
  * The session is the bridge between the pure simulation and the app: it
  * samples the controls once a frame, hands the input to the fixed 120 Hz
  * step, and drives everything that follows from the state of the jump — the
- * first-person camera, the wrist altimeter on the overlay, and the sound.
+ * first-person camera, the wrist altimeter on the overlay, the canopy over
+ * the jumper's head, the sound, and the debrief at the end.
  *
  * The session does not own the app: it is given a narrow host, so it can be
  * flown in a test without a WebGL context and without a ground of its own.
@@ -14,27 +15,41 @@
  * - The simulation never runs faster than real time. A frame that arrives
  *   late catches up at most twelve steps and lets the rest of the time go.
  * - Every step of a frame uses the input sampled for that frame, and the
- *   edges (the pull) are given to the first step only.
+ *   edges (the pull, the unstow, the PLF) are given to the first step only.
  * - A tab that comes back from the background does not jump the jumper
  *   ahead: the time spent in the background is not given to the simulation.
+ * - The phase of the jump drives the view: the jumper's eye in the freefall,
+ *   the swing from the ground to the canopy through the opening, and the
+ *   canopy's eye under the wing.
  */
 
 import * as THREE from 'three';
 import { JumpAudio } from '@/audio/JumpAudio';
 import { CANOPIES, DEFAULT_CANOPY, type CanopyId } from '@/data/canopies';
 import type { DropZone } from '@/data/dropzones';
-import { JumpCamera, freefallEye } from '@/render/JumpCamera';
+import { CanopyModel } from '@/render/CanopyModel';
+import {
+  JumpCamera,
+  canopyEye,
+  freefallEye,
+  openingEye,
+  type CameraPose,
+} from '@/render/JumpCamera';
 import { WristAltimeter } from '@/render/WristAltimeter';
 import { DEFAULT_AUDIBLE, type AudibleAlarm } from '@/sim/audible';
+import { computeDebrief, type DebriefData } from '@/sim/debrief';
 import { FixedStep } from '@/sim/FixedStep';
 import { bodyFrame } from '@/sim/freefall/freefall';
 import { NEUTRAL_INPUT, type JumpInput } from '@/sim/inputs';
 import { Jump } from '@/sim/Jump';
 import type { JumperParams } from '@/sim/jumper';
+import type { OpeningStage } from '@/sim/opening';
 import { Rng } from '@/sim/rng';
 import { defaultExit } from '@/sim/spot';
-import { FT, KT, formatAltitude } from '@/sim/units';
+import { FT, G, KT } from '@/sim/units';
 import { Wind, type WindProfile } from '@/sim/wind';
+import { CanopyControls, type CanopyScheme } from '@/ui/CanopyControls';
+import { DebriefScreen } from '@/ui/DebriefScreen';
 import { FreefallControls } from '@/ui/FreefallControls';
 import type { ControlScheme } from '@/ui/StartScreen';
 import { KeyboardSource } from '@/ui/input/keyboard';
@@ -43,15 +58,18 @@ import { TiltSource } from '@/ui/input/tilt';
 /**
  * What the session needs from the app it is flying in.
  *
- * The host is narrow on purpose: the session never draws the world, never
- * fetches a tile and never reads the URL. It asks where the ground is, where
- * the world has been rebased to, and it puts the watch on the overlay.
+ * The host is narrow on purpose: the session never fetches a tile and never
+ * reads the URL. It asks where the ground is, where the world has been
+ * rebased to, it puts the watch on the overlay, and it puts the canopy in
+ * the scene the jumper is flying through.
  */
 export interface JumpHost {
   /** The camera of the world: the jumper's eye. */
   camera: THREE.PerspectiveCamera;
   /** The scene and the camera of the first-person instruments. */
   overlay: { scene: THREE.Scene; camera: THREE.PerspectiveCamera };
+  /** The scene the world is drawn in: the canopy of the jumper goes in here. */
+  scene: THREE.Scene;
   /** Where the world has been rebased to, in metres. */
   originOffset(): { x: number; z: number };
   /** The height of the ground at a place in the local frame, in metres. */
@@ -99,6 +117,12 @@ const WATCH_LEFT_FRACTION = 0.55;
 /** How far below the centre the watch sits, of the half height. */
 const WATCH_DOWN_FRACTION = 0.6;
 
+/** How high the risers are above the jumper, in metres. */
+const RISER_HEIGHT_M = 0.4;
+
+/** How low the PLF is available, in feet above the ground. */
+const PLF_HEIGHT_FT = 30;
+
 /** The canopy of the jumper, when the name is one the app knows. */
 function canopyIdOf(id: string): CanopyId {
   return id in CANOPIES ? (id as CanopyId) : DEFAULT_CANOPY;
@@ -109,16 +133,23 @@ function stronger(a: number, b: number): number {
   return Math.abs(a) >= Math.abs(b) ? a : b;
 }
 
+/** The way the canopy is flown, from the way the freefall is flown. */
+function canopySchemeOf(scheme: ControlScheme): CanopyScheme {
+  return scheme === 'tilt' ? 'tilt-slider' : 'toggles';
+}
+
 export class JumpSession {
   /** The jump: the simulation of the jumper, from the exit to the ground. */
   readonly jump: Jump;
 
   /**
-   * Called when the jump is over and the app should go back to the start
-   * screen: when the player asks for another jump, and, once the canopy
-   * lands, when the jumper is on the ground.
+   * Called when the jumper asks for another jump: the debrief is on the
+   * screen and the button under it has been pressed.
    */
   onEnd: ((jump: Jump) => void) | null = null;
+
+  /** The debrief of the jump, once the jumper is on the ground. */
+  debrief: DebriefData | null = null;
 
   /** The input of the last frame, for the developer overlay. */
   get input(): JumpInput {
@@ -127,8 +158,43 @@ export class JumpSession {
 
   /** The heading the jumper is flying, in radians clockwise from north. */
   get headingRad(): number {
+    if (this.jump.canopy) return this.jump.canopyHeadingRad();
     const forward = bodyFrame(this.jump.freefall).forward;
     return Math.atan2(forward.x, -forward.z);
+  }
+
+  /** The stage of the opening, for the developer overlay. */
+  get openingStage(): string {
+    return this.jump.opening?.stage ?? '-';
+  }
+
+  /** The biggest load the opening put on the jumper, in g. */
+  get maxOpeningG(): number {
+    return this.jump.maxOpeningG;
+  }
+
+  /** The brakes of the canopy, as the jumper is holding them. */
+  get brakes(): string {
+    const canopy = this.jump.canopy;
+    if (!canopy) return '-';
+    return `${canopy.brakeLeft.toFixed(2)}/${canopy.brakeRight.toFixed(2)}`;
+  }
+
+  /** The bank of the canopy, in degrees. */
+  get bankDeg(): number {
+    const canopy = this.jump.canopy;
+    return canopy ? (canopy.bank * 180) / Math.PI : 0;
+  }
+
+  /** How fast the jumper is going through the air, in metres per second. */
+  get airspeedMs(): number {
+    const air = this.jump.airVelocity();
+    return Math.hypot(air.x, air.y, air.z);
+  }
+
+  /** How fast the canopy is sinking, in metres per second. */
+  get sinkMs(): number {
+    return this.jump.canopy ? -this.jump.velocity().y : 0;
   }
 
   private readonly host: JumpHost;
@@ -138,6 +204,12 @@ export class JumpSession {
 
   /** The touch layer of the freefall. */
   private readonly controls: FreefallControls;
+
+  /** The touch layer of the canopy. */
+  private readonly canopyControls: CanopyControls;
+
+  /** The debrief at the end of the jump. */
+  private readonly debriefScreen: DebriefScreen;
 
   /** The keyboard of the window. */
   private readonly keyboard: KeyboardSource;
@@ -157,8 +229,8 @@ export class JumpSession {
   /** True when the session made the sound itself, and has to let it go. */
   private readonly ownsAudio: boolean;
 
-  /** The units of the drop zone. */
-  private readonly units: 'ft' | 'm';
+  /** The drop zone the jump is made over. */
+  private readonly dz: DropZone;
 
   /** The input of this frame, used by every step of the frame. */
   private currentInput: JumpInput = { ...NEUTRAL_INPUT };
@@ -166,17 +238,35 @@ export class JumpSession {
   /** The pull that has not been given to the simulation yet. */
   private pendingPull = false;
 
+  /** The unstow that has not been given to the simulation yet. */
+  private pendingUnstow = false;
+
+  /** The PLF that has not been given to the simulation yet. */
+  private pendingPlf = false;
+
+  /** How far the jumper is looking up the lines, from 0 to 1. */
+  private lookUp = 0;
+
   /** How many of the jump's events have been handled. */
   private eventCursor = 0;
-
-  /** True once the simulation has been frozen, after the pull. */
-  private frozen = false;
 
   /** True while the page is in the background. */
   private paused = false;
 
-  /** The card shown after the pull. */
-  private card: HTMLDivElement | null = null;
+  /** True once the debrief has been shown. */
+  private debriefShown = false;
+
+  /** The view of the jumper at the throw, for the opening. */
+  private throwPose: CameraPose | null = null;
+
+  /** The canopy over the jumper's head. */
+  private canopyModel: CanopyModel | null = null;
+
+  /** The velocity of the jumper at the last frame, for the load of the opening. */
+  private lastVelocity: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
+
+  /** The time of the jump at the last frame. */
+  private lastT = 0;
 
   /** True once the session has been let go. */
   private disposed = false;
@@ -187,7 +277,7 @@ export class JumpSession {
    */
   constructor(host: JumpHost, opts: JumpSessionOptions) {
     this.host = host;
-    this.units = opts.dz.units;
+    this.dz = opts.dz;
 
     // The wind of the spot. The spot is made of the mean wind, and the
     // mean does not depend on the seed, so the wind here is only used to
@@ -226,6 +316,19 @@ export class JumpSession {
 
     this.controls = new FreefallControls(host.uiRoot, opts.scheme, this.tilt);
     this.controls.show(true);
+
+    // The canopy is flown with the same scheme as the freefall: the tilt
+    // banks the canopy and the slider gives the brakes, the fingers work
+    // the two edges of the screen.
+    this.canopyControls = new CanopyControls(
+      host.uiRoot,
+      canopySchemeOf(opts.scheme),
+      this.tilt,
+    );
+
+    this.debriefScreen = new DebriefScreen(host.uiRoot, opts.dz.units);
+    this.debriefScreen.onAgain = () => this.onEnd?.(this.jump);
+
     this.keyboard = new KeyboardSource(host.window);
 
     this.camera = new JumpCamera(host.camera);
@@ -245,8 +348,8 @@ export class JumpSession {
    * One frame of the jump.
    *
    * The controls are sampled once, the simulation is advanced by the time
-   * the frame took, and the camera, the watch and the sound follow the
-   * state of the jump.
+   * the frame took, and the camera, the watch, the canopy and the sound
+   * follow the state of the jump.
    *
    * @param dtS the time since the last frame, in seconds
    */
@@ -256,29 +359,30 @@ export class JumpSession {
     // given to the simulation.
     if (this.paused) return;
 
-    if (!this.frozen) {
-      this.currentInput = this.sampleInput(dtS);
-      this.fixed.advance(dtS);
-      this.handleEvents();
-    }
+    this.currentInput = this.sampleInput(dtS);
+    this.fixed.advance(dtS);
+    this.handleEvents();
 
     this.updateCamera();
     this.updateAltimeter();
     this.updateAudio();
+    this.updateCanopy();
+    this.updateLanding();
   }
 
-  /** Lets go of the session: the controls, the watch and the card. */
+  /** Lets go of the session: the controls, the watch, the canopy and the debrief. */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
 
     this.host.window.removeEventListener('visibilitychange', this.onVisibilityChange);
     this.controls.dispose();
+    this.canopyControls.dispose();
+    this.debriefScreen.dispose();
     this.keyboard.dispose();
     this.tilt?.dispose();
     this.host.overlay.scene.remove(this.altimeter.object);
-    this.card?.remove();
-    this.card = null;
+    this.removeCanopyModel();
     if (this.ownsAudio) this.audio.dispose();
   }
 
@@ -286,14 +390,20 @@ export class JumpSession {
    * The commands of the jumper, from the fingers and from the keys.
    *
    * The two are merged: the stronger command wins on every axis, and the
-   * buttons are on if either of them says so. The pull is an edge: it is
-   * held until the simulation has taken it.
+   * buttons are on if either of them says so. The pull, the unstow and the
+   * PLF are edges: they are held until the simulation has taken them.
    */
   private sampleInput(dtS: number): JumpInput {
     const touch = this.controls.sample();
     const keys = this.keyboard.sample(dtS);
+    const canopy = this.canopyControls.sample();
 
     if (touch.pull || keys.pull) this.pendingPull = true;
+    if (canopy.canopy.unstow || keys.canopy.unstow) this.pendingUnstow = true;
+    if (canopy.plf || keys.plf) this.pendingPlf = true;
+
+    // The phone tilted back looks up at the canopy, and so does the key.
+    this.lookUp = Math.max(canopy.lookUp, keys.lookUp);
 
     return {
       freefall: {
@@ -303,21 +413,37 @@ export class JumpSession {
         track: touch.freefall.track || keys.freefall.track,
       },
       pull: false,
-      canopy: keys.canopy,
-      plf: keys.plf,
+      canopy: {
+        left: stronger(canopy.canopy.left, keys.canopy.left),
+        right: stronger(canopy.canopy.right, keys.canopy.right),
+        frontLeft: stronger(canopy.canopy.frontLeft, keys.canopy.frontLeft),
+        frontRight: stronger(canopy.canopy.frontRight, keys.canopy.frontRight),
+        rear: stronger(canopy.canopy.rear, keys.canopy.rear),
+        unstow: false,
+      },
+      plf: false,
     };
   }
 
   /**
    * One step of the simulation.
    *
-   * Every step of the frame uses the input of the frame, and the pull is
+   * Every step of the frame uses the input of the frame, and the edges are
    * given to the first step only: the edge is delivered once.
    */
   private readonly onStep = (_dt: number, first: boolean): void => {
     const pull = first && this.pendingPull;
+    const unstow = first && this.pendingUnstow;
+    const plf = first && this.pendingPlf;
     if (pull) this.pendingPull = false;
-    this.jump.step({ ...this.currentInput, pull });
+    if (unstow) this.pendingUnstow = false;
+    if (plf) this.pendingPlf = false;
+    this.jump.step({
+      freefall: this.currentInput.freefall,
+      pull,
+      canopy: { ...this.currentInput.canopy, unstow },
+      plf,
+    });
   };
 
   /** The things that have happened since the last frame. */
@@ -330,62 +456,116 @@ export class JumpSession {
 
       if (event.type === 'alarm' && event.detail) {
         this.audio.alarm(event.detail as AudibleAlarm);
+      } else if (event.type === 'stage' && event.detail) {
+        this.openingSound(event.detail as OpeningStage);
+        if (event.detail === 'line-stretch') this.ensureCanopyModel();
       } else if (event.type === 'pull') {
-        this.freeze(
-          `Pull at ${formatAltitude(event.aglM, this.units)}. ` +
-            'The canopy arrives in the next update.',
-        );
-      } else if (event.type === 'touchdown') {
-        this.freeze(`The jump is over at ${formatAltitude(event.aglM, this.units)}.`);
+        // The freefall controls go at the throw: the fingers are on the
+        // canopy now, not on the body.
+        this.controls.show(false);
+        this.throwPose = this.freefallPose();
+      } else if (event.type === 'aad') {
+        // The reserve replaces the main: the model is built again.
+        this.controls.show(false);
+        this.replaceCanopyModel();
+      } else if (event.type === 'open') {
+        this.canopyControls.show(true);
+        this.audio.opening('quiet');
       }
     }
   }
 
   /**
-   * Stops the simulation and tells the player what happened.
+   * The sound of the opening.
    *
-   * The canopy does not fly yet: the simulation stops where the pull was,
-   * and the card says so.
+   * The flutter is the cloth beating, the snap is the canopy taking its
+   * shape, and the quiet is the sound of the canopy flying.
    */
-  private freeze(message: string): void {
-    if (this.frozen) return;
-    this.frozen = true;
-    this.controls.show(false);
-    this.showCard(message);
+  private openingSound(stage: OpeningStage): void {
+    if (stage === 'line-stretch') this.audio.opening('flutter');
+    else if (stage === 'inflation') this.audio.opening('snap');
   }
 
-  /** The card with the message and the button that starts the next jump. */
-  private showCard(message: string): void {
-    const card = document.createElement('div');
-    card.className = 'jump-card';
-    card.dataset.role = 'pull-card';
-    card.style.cssText = CARD_STYLE;
-
-    const text = document.createElement('p');
-    text.style.cssText = 'margin:0 0 10px';
-    text.textContent = message;
-    card.appendChild(text);
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.dataset.action = 'jump-again';
-    button.textContent = 'Jump again';
-    button.style.cssText = BUTTON_STYLE;
-    button.addEventListener('click', () => this.onEnd?.(this.jump));
-    card.appendChild(button);
-
-    this.host.uiRoot.appendChild(card);
-    this.card = card;
-  }
-
-  /** The eye of the jumper, looking along the wind and the head. */
+  /**
+   * The eye of the jumper.
+   *
+   * The freefall looks along the wind and the head, the opening swings
+   * from the ground to the canopy, and under the canopy the jumper looks
+   * ahead along the heading, or up the lines when they look up.
+   */
   private updateCamera(): void {
-    const pose = freefallEye(
+    this.camera.apply(this.currentPose(), this.host.originOffset(), this.shakeG());
+
+    // The velocity of this frame is the one the next frame is measured
+    // against, for the load of the opening.
+    this.lastVelocity = this.jump.velocity();
+    this.lastT = this.jump.tS;
+  }
+
+  /** The pose of the eye, in the phase the jumper is in. */
+  private currentPose(): CameraPose {
+    const phase = this.jump.phase;
+    if (phase === 'freefall') return this.freefallPose();
+    if (phase === 'opening') {
+      const from = this.throwPose ?? this.freefallPose();
+      return openingEye(from, this.canopyPose(), this.jump.opening?.inflation ?? 0);
+    }
+    return this.canopyPose();
+  }
+
+  /** The eye of the jumper in the freefall. */
+  private freefallPose(): CameraPose {
+    return freefallEye(
       bodyFrame(this.jump.freefall),
       this.jump.airVelocity(),
       this.jump.position(),
     );
-    this.camera.apply(pose, this.host.originOffset(), 0);
+  }
+
+  /** The eye of the jumper under the canopy. */
+  private canopyPose(): CameraPose {
+    const canopy = this.jump.canopy;
+    return canopyEye({
+      pos: this.jump.position(),
+      headingRad: canopy ? this.jump.canopyHeadingRad() : this.jumperHeadingRad(),
+      swingFore: canopy?.swingFore ?? 0,
+      swingSide: canopy?.swingSide ?? 0,
+      lookUp: this.lookUp,
+    });
+  }
+
+  /**
+   * The heading the jumper is going, in radians clockwise from north.
+   *
+   * Before the canopy is out there is no wing to ask, so the heading of the
+   * jumper's own speed is used: that is the way the canopy will open.
+   */
+  private jumperHeadingRad(): number {
+    const velocity = this.jump.velocity();
+    return Math.atan2(velocity.x, -velocity.z);
+  }
+
+  /**
+   * The load of the opening, in g over the one g of the fall.
+   *
+   * The load is what the jumper felt: the change of the velocity between
+   * two frames, less the pull of the earth. The shake is the part of it
+   * above one g, which is what a hard opening is.
+   */
+  private shakeG(): number {
+    if (this.jump.phase !== 'opening') return 0;
+
+    const dt = this.jump.tS - this.lastT;
+    if (dt <= 0) return 0;
+
+    const velocity = this.jump.velocity();
+    const accel = {
+      x: (velocity.x - this.lastVelocity.x) / dt,
+      y: (velocity.y - this.lastVelocity.y) / dt,
+      z: (velocity.z - this.lastVelocity.z) / dt,
+    };
+    const load = Math.hypot(accel.x, accel.y + G, accel.z) / G;
+    return Math.max(0, load - 1);
   }
 
   /**
@@ -408,12 +588,117 @@ export class JumpSession {
     this.altimeter.setAltitude(this.jump.altitudeAglM());
   }
 
-  /** The wind in the ears, and the siren of the audible altimeter. */
+  /**
+   * The wind in the ears, and the siren of the audible altimeter.
+   *
+   * The wind of the freefall is loud, the wind under the canopy is soft,
+   * and the wind of a jumper who is on the ground is nothing.
+   */
   private updateAudio(): void {
+    const phase = this.jump.phase;
     const air = this.jump.airVelocity();
     const speed = Math.hypot(air.x, air.y, air.z);
-    this.audio.setWind(speed, 'freefall');
+
+    if (phase === 'landed') this.audio.setWind(0, 'silent');
+    else if (phase === 'canopy' || phase === 'landing') this.audio.setWind(speed, 'canopy');
+    else this.audio.setWind(speed, 'freefall');
+
     this.audio.setContinuous(this.jump.audible.continuous);
+  }
+
+  /**
+   * The canopy over the jumper's head.
+   *
+   * The model sits at the risers, on the jumper's shoulders, and the wing
+   * is up the lines from there. Through the opening it is inflated as far
+   * as the opening has got, and once the canopy is flying it is full.
+   */
+  private updateCanopy(): void {
+    const jump = this.jump;
+
+    // The PLF is only for the last few feet of the jump.
+    this.canopyControls.setPlfAvailable(jump.heightAboveGround() <= PLF_HEIGHT_FT * FT);
+
+    const model = this.canopyModel;
+    if (!model) return;
+
+    const position = jump.position();
+    const offset = this.host.originOffset();
+    model.object.position.set(
+      position.x - offset.x,
+      position.y + RISER_HEIGHT_M,
+      position.z - offset.z,
+    );
+
+    const opening = jump.opening;
+    if (jump.phase === 'opening' && opening) {
+      model.setInflation(opening.inflation, opening.slider);
+    } else {
+      model.setInflation(1, 0);
+    }
+
+    const canopy = jump.canopy;
+    if (canopy) {
+      model.setPose({
+        headingRad: jump.canopyHeadingRad(),
+        bank: canopy.bank,
+        swingFore: canopy.swingFore,
+        swingSide: canopy.swingSide,
+      });
+      model.setBrakes(canopy.brakeLeft, canopy.brakeRight);
+    } else {
+      model.setPose({
+        headingRad: this.jumperHeadingRad(),
+        bank: 0,
+        swingFore: 0,
+        swingSide: 0,
+      });
+      model.setBrakes(0, 0);
+    }
+  }
+
+  /** Builds the canopy of the jumper, if it is not there yet. */
+  private ensureCanopyModel(): void {
+    if (this.canopyModel) return;
+    this.replaceCanopyModel();
+  }
+
+  /** Builds the canopy of the jumper again, for the canopy it is flying now. */
+  private replaceCanopyModel(): void {
+    this.removeCanopyModel();
+    const model = new CanopyModel(this.jump.canopySpec);
+    this.host.scene.add(model.object);
+    this.canopyModel = model;
+  }
+
+  /** Takes the canopy of the jumper off the scene. */
+  private removeCanopyModel(): void {
+    const model = this.canopyModel;
+    if (!model) return;
+    this.host.scene.remove(model.object);
+    model.dispose();
+    this.canopyModel = null;
+  }
+
+  /**
+   * The jumper is on the ground: the controls go away and the debrief
+   * comes up.
+   */
+  private updateLanding(): void {
+    if (this.debriefShown || this.jump.phase !== 'landed') return;
+    this.debriefShown = true;
+
+    this.controls.show(false);
+    this.canopyControls.show(false);
+
+    const data = computeDebrief(this.jump);
+    this.debrief = data;
+    this.debriefScreen.show(data, {
+      dzName: this.dz.name,
+      canopyName: this.jump.canopySpec.name,
+      lzRadiusM: this.dz.lzRadiusM,
+      track: this.jump.track,
+    });
   }
 
   /** The page went to the background, or came back from it. */
@@ -429,30 +714,3 @@ export class JumpSession {
     }
   };
 }
-
-/** The card that tells the player what happened. */
-const CARD_STYLE = [
-  'position:absolute',
-  'left:50%',
-  'top:50%',
-  'transform:translate(-50%,-50%)',
-  'padding:18px 22px',
-  'border-radius:10px',
-  'background:rgba(0,0,0,0.62)',
-  'border:1px solid rgba(255,255,255,0.3)',
-  'color:#fff',
-  'font:14px/1.5 system-ui,-apple-system,sans-serif',
-  'text-align:center',
-  'pointer-events:auto',
-].join(';');
-
-/** The button that starts the next jump. */
-const BUTTON_STYLE = [
-  'min-height:44px',
-  'padding:8px 18px',
-  'font:inherit',
-  'color:#fff',
-  'background:transparent',
-  'border:1px solid rgba(255,255,255,0.6)',
-  'border-radius:6px',
-].join(';');

@@ -345,3 +345,110 @@ body {
   display: none;
 }
 
+/* ---- the debrief at the end of the jump ---- */
+
+.debrief {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  overflow-y: auto;
+  padding: calc(16px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font: 15px/1.5 system-ui, -apple-system, sans-serif;
+  pointer-events: auto;
+}
+
+.debrief[hidden] {
+  display: none;
+}
+
+.debrief-panel {
+  width: 100%;
+  max-width: 24rem;
+  /* The panel sits in the middle of the screen when it fits, and the
+     screen scrolls when it does not. */
+  margin: auto;
+}
+
+.debrief-title {
+  margin: 0 0 2px;
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.debrief-subtitle {
+  margin: 0 0 14px;
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.debrief-outcome {
+  margin: 0 0 16px;
+  font-size: 17px;
+}
+
+.debrief-numbers {
+  margin: 0 0 16px;
+}
+
+.debrief-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.debrief-label {
+  margin: 0;
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.debrief-value {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.debrief-flags {
+  margin: 0 0 16px;
+  padding-left: 18px;
+}
+
+.debrief-flag {
+  margin: 0 0 4px;
+}
+
+.debrief-figure {
+  margin: 0 0 16px;
+}
+
+.debrief-profile,
+.debrief-track {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+}
+
+.debrief-caption {
+  margin: 4px 0 0;
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.debrief-again {
+  width: 100%;
+  min-height: 48px;
+  font: inherit;
+  font-size: 16px;
+  color: #fff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+}
+

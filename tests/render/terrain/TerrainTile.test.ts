@@ -34,10 +34,11 @@ function v(geo: BufferGeometry, i: number): number {
 
 describe('gridSizeForZoom', () => {
   it('grid sizes by zoom', () => {
-    expect(gridSizeForZoom(18)).toBe(65);
-    expect(gridSizeForZoom(16)).toBe(65);
+    expect(gridSizeForZoom(18)).toBe(33);
+    expect(gridSizeForZoom(16)).toBe(33);
     expect(gridSizeForZoom(14)).toBe(33);
-    expect(gridSizeForZoom(12)).toBe(33);
+    expect(gridSizeForZoom(13)).toBe(17);
+    expect(gridSizeForZoom(12)).toBe(17);
     expect(gridSizeForZoom(8)).toBe(17);
   });
 });
@@ -145,19 +146,23 @@ describe('updateTileHeights', () => {
 describe('TerrainTile', () => {
   const coord = { z: 14, x: 8550, y: 5784 };
 
+  // A zoom-14 tile is draped on the zoom-12 elevation tile: the heights come
+  // from two zooms coarser than the imagery.
+  const drapeZoom = 12;
+
   it('sits at the centre of its tile', () => {
-    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, 14);
+    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, drapeZoom);
     expect(tile.mesh.position.x).toBeCloseTo(50, 6);
     expect(tile.mesh.position.z).toBeCloseTo(50, 6);
     expect(tile.coord).toEqual(coord);
     expect(tile.bounds).toEqual(b);
-    expect(tile.elevZoom).toBe(14);
+    expect(tile.elevZoom).toBe(12);
     expect(tile.textureZoom).toBeNull();
     expect(tile.ready).toBe(false);
   });
 
   it('takes the texture as sRGB, unflipped', () => {
-    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, 14);
+    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, drapeZoom);
     const tex = new Texture();
     tile.setTexture(tex);
 
@@ -171,7 +176,7 @@ describe('TerrainTile', () => {
   it('applies the atmosphere to the material once', () => {
     const atmo = new Atmosphere();
     const spy = vi.spyOn(atmo, 'applyTo');
-    const tile = new TerrainTile(coord, b, atmo, () => 0, 14);
+    const tile = new TerrainTile(coord, b, atmo, () => 0, drapeZoom);
 
     tile.setTexture(new Texture());
     tile.setTexture(new Texture());
@@ -179,11 +184,11 @@ describe('TerrainTile', () => {
   });
 
   it('rebuilds the heights in place', () => {
-    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, 14);
+    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, drapeZoom);
     const gridSize = gridSizeForZoom(14);
-    tile.rebuildHeights(() => 7, 12);
+    tile.rebuildHeights(() => 7, 13);
 
-    expect(tile.elevZoom).toBe(12);
+    expect(tile.elevZoom).toBe(13);
     const pos = tile.mesh.geometry.getAttribute('position');
     for (let i = 0; i < gridSize * gridSize; i++) {
       expect(pos.getY(i)).toBeCloseTo(7, 6);
@@ -191,7 +196,7 @@ describe('TerrainTile', () => {
   });
 
   it('disposes the geometry and the material, but not the texture', () => {
-    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, 14);
+    const tile = new TerrainTile(coord, b, new Atmosphere(), () => 0, drapeZoom);
     const tex = new Texture();
     const texSpy = vi.spyOn(tex, 'dispose');
     const geoSpy = vi.spyOn(tile.mesh.geometry, 'dispose');

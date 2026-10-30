@@ -28,11 +28,13 @@ export interface TileBounds {
  * Vertices per side of a tile, by zoom.
  *
  * Fine tiles get a dense grid, coarse ones stay cheap: a tile of the far
- * horizon does not need to describe every bump of the ground.
+ * horizon does not need to describe every bump of the ground. Thirty-three
+ * vertices per side is as fine as it goes: the elevation under a tile is two
+ * zooms coarser than the imagery, so a denser grid would only repeat the
+ * same heights.
  */
 export function gridSizeForZoom(z: number): number {
-  if (z >= 16) return 65;
-  if (z >= 12) return 33;
+  if (z >= 14) return 33;
   return 17;
 }
 

@@ -15,16 +15,16 @@ import { curvatureDrop, lonLatToMercator, tileBoundsMercator, tileKey, EARTH_RAD
 import type { LocalFrame, LonLat, TileCoord } from './geo';
 import { TERRARIUM_TILE_SIZE } from './terrarium';
 
-/** Default zoom of the elevation tiles: ~6 m per pixel at Interlaken. */
-const DEFAULT_MAX_ZOOM = 14;
+/** Default zoom of the elevation tiles: ~26 m per pixel at Interlaken. */
+const DEFAULT_MAX_ZOOM = 12;
 
 /**
  * Default number of height tiles kept in memory.
  *
- * A tile is 256 KB of floats, so this is about 48 MB: enough for the ground
+ * A tile is 256 KB of floats, so this is about 16 MB: enough for the ground
  * around the drop zone, little enough to keep the phone happy.
  */
-const DEFAULT_MAX_TILES = 192;
+const DEFAULT_MAX_TILES = 64;
 
 /** Edge length of a tile in pixels; row 0 is the north edge. */
 const TILE = TERRARIUM_TILE_SIZE;
@@ -54,9 +54,9 @@ interface ElevationTile {
 
 /** How the grid is allowed to look. Every field has a default. */
 export interface ElevationGridOptions {
-  /** Finest zoom of the elevation tiles. Default 14. */
+  /** Finest zoom of the elevation tiles. Default 12. */
   maxZoom?: number;
-  /** Height tiles kept in memory; the least recently used one is thrown away. Default 192. */
+  /** Height tiles kept in memory; the least recently used one is thrown away. Default 64. */
   maxTiles?: number;
   /** Called with every tile that is thrown away. */
   onEvict?: (t: TileCoord) => void;
@@ -169,13 +169,18 @@ export class ElevationGrid {
   }
 
   /**
-   * The elevation tile a render tile needs: the same column and row scaled to
-   * the zoom min(t.z, maxZoom).
+   * The elevation tile a render tile needs.
+   *
+   * The imagery of a tile is draped on an elevation tile that is two zooms
+   * coarser: a mesh has at most 33 vertices per side, so a height field with
+   * 64 samples across the tile already says more than the mesh can use, and
+   * the height data outside the US is 30 m SRTM to begin with. The zoom is
+   * capped at the finest elevation that is fetched and never below zoom 1.
    */
   elevationTileFor(t: TileCoord): TileCoord {
-    if (t.z <= this.maxZoom) return { z: t.z, x: t.x, y: t.y };
-    const shift = 2 ** (t.z - this.maxZoom);
-    return { z: this.maxZoom, x: Math.floor(t.x / shift), y: Math.floor(t.y / shift) };
+    const z = clamp(t.z - 2, 1, this.maxZoom);
+    const shift = 2 ** (t.z - z);
+    return { z, x: Math.floor(t.x / shift), y: Math.floor(t.y / shift) };
   }
 
   /** The highest zoom at or below maxZoom whose loaded tile covers the point. */

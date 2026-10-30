@@ -46,14 +46,17 @@ export interface ZoomCap {
 }
 
 /**
- * Imagery zoom by distance from the landing zone: 18 within 1.5 km, 17
- * within 4 km, 16 within 10 km, 14 within 30 km, 12 to 100 km and 9 to
+ * Imagery zoom by distance from the landing zone: 17 within 1.5 km, 16
+ * within 4 km, 15 within 10 km, 14 within 30 km, 12 to 100 km and 9 to
  * the horizon.
+ *
+ * The caps are a phone budget: the imagery of a tile is only worth its
+ * bytes when the screen can show the difference.
  */
 export const DEFAULT_ZOOM_CAPS: ZoomCap[] = [
-  { radiusM: 1500, maxZoom: 18 },
-  { radiusM: 4000, maxZoom: 17 },
-  { radiusM: 10000, maxZoom: 16 },
+  { radiusM: 1500, maxZoom: 17 },
+  { radiusM: 4000, maxZoom: 16 },
+  { radiusM: 10000, maxZoom: 15 },
   { radiusM: 30000, maxZoom: 14 },
   { radiusM: 100000, maxZoom: 12 },
   { radiusM: Infinity, maxZoom: 9 },
@@ -83,13 +86,13 @@ export interface HeightRange {
 }
 
 const DEFAULT_CONFIG: LodConfig = {
-  tau: 1.0,
-  rootZoom: 8,
-  maxZoom: 18,
+  tau: 1.8,
+  rootZoom: 7,
+  maxZoom: 17,
   rootRadiusM: 250000,
   zoomCaps: DEFAULT_ZOOM_CAPS,
   viewMarginRad: 0.35,
-  maxLeaves: 400,
+  maxLeaves: 160,
 };
 
 /** An axis-aligned box in the local frame. */

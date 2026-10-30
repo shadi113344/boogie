@@ -47,26 +47,34 @@ describe('ElevationGrid', () => {
     expect(g.groundY(0, 0)).toBe(0);
   });
 
-  it('elevationTileFor caps zoom at maxZoom and rescales x,y', () => {
+  it('elevationTileFor drapes a tile on the elevation two zooms coarser', () => {
     const g = new ElevationGrid(frame);
-    expect(g.maxZoom).toBe(14);
-    expect(g.elevationTileFor({ z: 16, x: 34202, y: 23137 })).toEqual({ z: 14, x: 8550, y: 5784 });
-    expect(g.elevationTileFor({ z: 10, x: 534, y: 361 })).toEqual({ z: 10, x: 534, y: 361 });
+    expect(g.maxZoom).toBe(12);
+
+    // A zoom-14 tile lies in the zoom-12 tile that contains it.
+    expect(g.elevationTileFor({ z: 14, x: 34200, y: 23136 })).toEqual({ z: 12, x: 8550, y: 5784 });
+    // Finer than the finest elevation the grid fetches: the cap holds.
+    expect(g.elevationTileFor({ z: 16, x: 34202, y: 23137 })).toEqual({ z: 12, x: 2137, y: 1446 });
+    expect(g.elevationTileFor({ z: 17, x: 68404, y: 46274 })).toEqual({ z: 12, x: 2137, y: 1446 });
+    // Two zooms coarser, with the cap out of the way.
+    expect(g.elevationTileFor({ z: 7, x: 4276, y: 2892 })).toEqual({ z: 5, x: 1069, y: 723 });
+    // Zoom 1 is the coarsest elevation there is.
+    expect(g.elevationTileFor({ z: 2, x: 1, y: 2 })).toEqual({ z: 1, x: 0, y: 1 });
   });
 
   it('elevationTileFor honours a custom maxZoom', () => {
-    const g = new ElevationGrid(frame, { maxZoom: 12 });
-    expect(g.maxZoom).toBe(12);
-    expect(g.elevationTileFor({ z: 16, x: 34202, y: 23137 })).toEqual({ z: 12, x: 2137, y: 1446 });
-    expect(g.elevationTileFor({ z: 12, x: 2137, y: 1445 })).toEqual({ z: 12, x: 2137, y: 1445 });
+    const g = new ElevationGrid(frame, { maxZoom: 10 });
+    expect(g.maxZoom).toBe(10);
+    expect(g.elevationTileFor({ z: 14, x: 34200, y: 23136 })).toEqual({ z: 10, x: 2137, y: 1446 });
+    expect(g.elevationTileFor({ z: 12, x: 2137, y: 1446 })).toEqual({ z: 10, x: 534, y: 361 });
   });
 
   it('samples bilinearly inside a ramp tile', () => {
     const g = new ElevationGrid(frame);
-    const t = lonLatToTile(ORIGIN, 14);
-    const south = { z: 14, x: t.x, y: t.y + 1 };
-    g.addTile(t, rampTile(14, t.x, t.y));
-    g.addTile(south, rampTile(14, south.x, south.y));
+    const t = lonLatToTile(ORIGIN, 12);
+    const south = { z: 12, x: t.x, y: t.y + 1 };
+    g.addTile(t, rampTile(12, t.x, t.y));
+    g.addTile(south, rampTile(12, south.x, south.y));
 
     // A quarter of a tile south, measured in the local frame's metres.
     const b = tileBoundsMercator(t);
@@ -76,15 +84,15 @@ describe('ElevationGrid', () => {
     const s = g.sample(frame.toLonLat(0, quarter));
     expect(a).not.toBeNull();
     expect(s).not.toBeNull();
-    expect(a?.zoom).toBe(14);
-    expect(s?.zoom).toBe(14);
+    expect(a?.zoom).toBe(12);
+    expect(s?.zoom).toBe(12);
     // The ramp climbs 1 m per row, and a quarter tile is 64 rows.
     expect((s?.height ?? 0) - (a?.height ?? 0)).toBeCloseTo(64, 1);
   });
 
   it('interpolates between pixel centres along a column ramp', () => {
     const g = new ElevationGrid(frame);
-    const t = lonLatToTile(ORIGIN, 14);
+    const t = lonLatToTile(ORIGIN, 12);
     const heights = new Float32Array(TILE * TILE);
     for (let row = 0; row < TILE; row++) {
       for (let col = 0; col < TILE; col++) heights[row * TILE + col] = col;
@@ -92,7 +100,7 @@ describe('ElevationGrid', () => {
     g.addTile(t, heights);
 
     const a = g.sampleLocal(0, 0);
-    const b = g.sampleLocal(metersPerPixel(ORIGIN.lat, 14), 0);
+    const b = g.sampleLocal(metersPerPixel(ORIGIN.lat, 12), 0);
     // One pixel further east is one metre higher on this ramp.
     expect(b - a).toBeCloseTo(1, 6);
     // The origin falls between two pixel centres, so the height is fractional.
@@ -101,7 +109,7 @@ describe('ElevationGrid', () => {
 
   it('puts the pixel centres at (i + 0.5) / 256', () => {
     const g = new ElevationGrid(frame);
-    const t = lonLatToTile(ORIGIN, 14);
+    const t = lonLatToTile(ORIGIN, 12);
     const heights = new Float32Array(TILE * TILE);
     for (let row = 0; row < TILE; row++) {
       for (let col = 0; col < TILE; col++) heights[row * TILE + col] = col;
@@ -118,19 +126,19 @@ describe('ElevationGrid', () => {
 
   it('prefers the finest loaded tile', () => {
     const g = new ElevationGrid(frame);
+    const t10 = lonLatToTile(ORIGIN, 10);
     const t12 = lonLatToTile(ORIGIN, 12);
-    const t14 = lonLatToTile(ORIGIN, 14);
-    g.addTile(t12, flatTile(100));
-    g.addTile(t14, flatTile(200));
+    g.addTile(t10, flatTile(100));
+    g.addTile(t12, flatTile(200));
 
     expect(g.tileCount()).toBe(2);
+    expect(g.hasTile(t10)).toBe(true);
     expect(g.hasTile(t12)).toBe(true);
-    expect(g.hasTile(t14)).toBe(true);
-    expect(g.finestLoadedTileFor(ORIGIN)).toEqual(t14);
+    expect(g.finestLoadedTileFor(ORIGIN)).toEqual(t12);
 
     const s = g.sample(ORIGIN);
     expect(s?.height).toBe(200);
-    expect(s?.zoom).toBe(14);
+    expect(s?.zoom).toBe(12);
   });
 
   it('falls back to a coarser loaded tile', () => {
@@ -146,7 +154,7 @@ describe('ElevationGrid', () => {
 
   it('keeps negative heights', () => {
     const g = new ElevationGrid(frame);
-    const t = lonLatToTile(ORIGIN, 14);
+    const t = lonLatToTile(ORIGIN, 12);
     g.addTile(t, flatTile(-3));
 
     const s = g.sample(ORIGIN);
@@ -156,7 +164,7 @@ describe('ElevationGrid', () => {
 
   it('groundY subtracts curvature', () => {
     const g = new ElevationGrid(frame);
-    const t = lonLatToTile(frame.toLonLat(10000, 0), 14);
+    const t = lonLatToTile(frame.toLonLat(10000, 0), 12);
     g.addTile(t, flatTile(0));
 
     expect(g.sampleLocal(10000, 0)).toBe(0);
@@ -165,18 +173,18 @@ describe('ElevationGrid', () => {
   });
 
   it('samples ten thousand points in one tile the same as a grid that has to walk', () => {
-    const t = lonLatToTile(ORIGIN, 14);
-    const east = { z: 14, x: t.x + 1, y: t.y };
+    const t = lonLatToTile(ORIGIN, 12);
+    const east = { z: 12, x: t.x + 1, y: t.y };
 
     // One grid with the tile on its own: the tile that answered last time is
     // the tile that answers now.
     const cached = new ElevationGrid(frame);
-    cached.addTile(t, rampTile(14, t.x, t.y));
+    cached.addTile(t, rampTile(12, t.x, t.y));
 
     // Another grid with a second tile beside it, so the points of the first
     // tile are answered by a walk through the zooms every time.
     const walked = new ElevationGrid(frame);
-    walked.addTile(t, rampTile(14, t.x, t.y));
+    walked.addTile(t, rampTile(12, t.x, t.y));
     const eastHeights = new Float32Array(TILE * TILE);
     for (let row = 0; row < TILE; row++) {
       for (let col = 0; col < TILE; col++) eastHeights[row * TILE + col] = 1000 + col;
@@ -219,61 +227,54 @@ describe('ElevationGrid', () => {
 
     // The remembered tile does not change the answer, and the answer comes
     // from the tile the point is in.
-    expect([...zooms]).toEqual([14]);
+    expect([...zooms]).toEqual([12]);
     expect(worst).toBe(0);
   });
 
-  it('keeps 192 height tiles by default', () => {
+  it('keeps 64 height tiles by default', () => {
     const g = new ElevationGrid(frame);
 
     // One array for all of them: the test is about the number of tiles the
     // grid keeps, not about the heights in them.
     const heights = flatTile(100);
     for (let i = 0; i < 200; i++) {
-      g.addTile({ z: 14, x: i, y: 0 }, heights);
+      g.addTile({ z: 12, x: i, y: 0 }, heights);
     }
 
-    expect(g.tileCount()).toBe(192);
+    expect(g.tileCount()).toBe(64);
   });
 
   it('throws the least recently used tile away when it runs out of room', () => {
     const evicted: TileCoord[] = [];
     const g = new ElevationGrid(frame, {
-      maxTiles: 192,
+      maxTiles: 64,
       onEvict: (t) => evicted.push(t),
     });
 
     const heights = flatTile(100);
     for (let i = 0; i < 200; i++) {
-      g.addTile({ z: 14, x: i, y: 0 }, heights);
+      g.addTile({ z: 12, x: i, y: 0 }, heights);
     }
 
-    // The first eight tiles are the ones that have been out of the way the
-    // longest, so they are the ones that go.
-    expect(g.tileCount()).toBe(192);
-    expect(evicted.length).toBe(8);
-    expect(evicted.map(tileKey)).toEqual([
-      '14/0/0',
-      '14/1/0',
-      '14/2/0',
-      '14/3/0',
-      '14/4/0',
-      '14/5/0',
-      '14/6/0',
-      '14/7/0',
-    ]);
-    expect(g.hasTile({ z: 14, x: 0, y: 0 })).toBe(false);
-    expect(g.hasTile({ z: 14, x: 7, y: 0 })).toBe(false);
-    expect(g.hasTile({ z: 14, x: 8, y: 0 })).toBe(true);
-    expect(g.hasTile({ z: 14, x: 199, y: 0 })).toBe(true);
+    // The tiles that have been out of the way the longest are the ones that
+    // go: the first hundred and thirty-six of them.
+    expect(g.tileCount()).toBe(64);
+    expect(evicted.length).toBe(136);
+    expect(evicted.map(tileKey)).toEqual(
+      Array.from({ length: 136 }, (_, i) => `12/${i}/0`),
+    );
+    expect(g.hasTile({ z: 12, x: 0, y: 0 })).toBe(false);
+    expect(g.hasTile({ z: 12, x: 135, y: 0 })).toBe(false);
+    expect(g.hasTile({ z: 12, x: 136, y: 0 })).toBe(true);
+    expect(g.hasTile({ z: 12, x: 199, y: 0 })).toBe(true);
   });
 
   it('keeps a tile that has been sampled from being the next one thrown away', () => {
     const g = new ElevationGrid(frame, { maxTiles: 2 });
 
-    const home = lonLatToTile(ORIGIN, 14);
-    const east = { z: 14, x: home.x + 1, y: home.y };
-    const west = { z: 14, x: home.x - 1, y: home.y };
+    const home = lonLatToTile(ORIGIN, 12);
+    const east = { z: 12, x: home.x + 1, y: home.y };
+    const west = { z: 12, x: home.x - 1, y: home.y };
 
     g.addTile(home, flatTile(100));
     g.addTile(east, flatTile(200));
@@ -296,9 +297,9 @@ describe('ElevationGrid', () => {
     const g = new ElevationGrid(frame, { maxTiles: 1 });
     g.onEvict = (t) => evicted.push(t);
 
-    const first = { z: 14, x: 3, y: 4 };
+    const first = { z: 12, x: 3, y: 4 };
     g.addTile(first, flatTile(100));
-    g.addTile({ z: 14, x: 5, y: 6 }, flatTile(200));
+    g.addTile({ z: 12, x: 5, y: 6 }, flatTile(200));
 
     expect(evicted).toEqual([first]);
     expect(g.hasTile(first)).toBe(false);

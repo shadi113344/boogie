@@ -46,13 +46,15 @@ export interface TerrainOptions {
 }
 
 /**
- * The high tier's numbers. Task 11 owns the tiers and passes their own.
+ * The default numbers: the budget of a phone.
+ *
+ * The quality tiers own their own numbers, and the app passes theirs in.
  */
 export const DEFAULT_TERRAIN_OPTIONS: Required<TerrainOptions> = {
-  tau: 1.0,
+  tau: 1.8,
   anisotropy: 8,
-  maxTextures: 512,
-  maxVisibleTiles: 400,
+  maxTextures: 256,
+  maxVisibleTiles: 160,
   disposeDelayMs: 2000,
   maxBuildsPerUpdate: 8,
 };
@@ -343,11 +345,11 @@ export class Terrain {
   /**
    * Whether the ground under a tile is known finely enough to draw it.
    *
-   * The imagery of a tile is draped on the elevation tile of the same zoom,
-   * capped at the finest zoom of the elevation: the zoom-14 tile for every
-   * tile of zoom 14 and finer, the tile's own zoom below that. Until that
-   * tile has arrived the tile is not asked for, because the selection it
-   * would be drawn at is not settled yet.
+   * The imagery of a tile is draped on an elevation tile that is two zooms
+   * coarser, capped at the finest zoom of the elevation: the zoom-12 tile
+   * for every tile of zoom 14 and finer, the tile's own zoom below that.
+   * Until that tile has arrived the tile is not asked for, because the
+   * selection it would be drawn at is not settled yet.
    */
   private elevationReady(coord: TileCoord): boolean {
     return this.elevation.hasTile(this.elevation.elevationTileFor(coord));
@@ -498,6 +500,17 @@ export class Terrain {
   setTau(tau: number): void {
     this.options.tau = tau;
     this.quadtree.config.tau = tau;
+  }
+
+  /**
+   * How many tiles the terrain shows at once.
+   *
+   * The budget of the selection is the same number: every leaf of the
+   * selection can end up on screen, so the two are kept in step.
+   */
+  setMaxVisibleTiles(maxVisibleTiles: number): void {
+    this.options.maxVisibleTiles = maxVisibleTiles;
+    this.quadtree.config.maxLeaves = maxVisibleTiles;
   }
 
   /** The anisotropic filtering on the imagery. */

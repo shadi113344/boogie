@@ -67,6 +67,9 @@ export class FreeCamera {
   /** The height above the ground, from the last update. */
   private lastAgl = 0;
 
+  /** Whether the user has taken the camera over. */
+  private _userMoved = false;
+
   constructor(
     camera: THREE.PerspectiveCamera,
     dom: HTMLElement,
@@ -88,6 +91,16 @@ export class FreeCamera {
   /** The height of the camera above the ground, in metres. */
   get agl(): number {
     return this.lastAgl;
+  }
+
+  /**
+   * Whether the user has moved the camera.
+   *
+   * The flag is never taken back: once the user has taken the camera over,
+   * the app stops putting it where the exit is. A pointer or a key sets it.
+   */
+  get userMoved(): boolean {
+    return this._userMoved;
   }
 
   /**
@@ -182,6 +195,7 @@ export class FreeCamera {
   }
 
   private readonly onPointerDown = (event: PointerEvent): void => {
+    this._userMoved = true;
     const id = pointerIdOf(event);
     this.pointers.set(id, { x: event.clientX, y: event.clientY });
 
@@ -276,6 +290,7 @@ export class FreeCamera {
   }
 
   private readonly onKeyDown = (event: KeyboardEvent): void => {
+    this._userMoved = true;
     this.keys.add(event.key.toLowerCase());
   };
 

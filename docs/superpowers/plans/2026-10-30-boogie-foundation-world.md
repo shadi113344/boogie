@@ -647,3 +647,23 @@ Carried into Plan 2 (milestones 3 and 4), in priority order:
 3. Prefetch of the landing-area cone and the jump run before exit (milestone 5 in the spec, but the cold-start numbers argue for doing the landing-area part earlier).
 4. The overlay's `update ms` line; the exit button follows the drop zone's `exitAltitudeFt`.
 5. Phone pass on the iPhone and the Android: frame rate per tier, tile pops, landing-area placement at all six drop zones; the pane cannot measure these.
+
+## Task 13: phone-first budgets (2026-10-30, after the first phone test)
+
+The first test on an iPhone and on a laptop: far too heavy to load. Measured with the code's own quadtree and real tile sizes (Terrarium elevation PNGs are 80 to 150 KB over the Alps and 18 to 34 KB over desert, imagery JPEGs 10 to 20 KB; from Egypt the elevation server answers in about 530 ms per tile and the imagery CDN in about 175 ms):
+
+| Cold load | Before | After |
+|---|---|---|
+| iPhone at exit altitude (medium tier) | ~200 leaves, 200 to 240 elevation tiles (over the 192-tile cap, so the grid churned), 23 to 27 MB | 126 to 159 leaves, 15 to 22 elevation tiles, 3.9 to 5.2 MB |
+| 1080p laptop at exit altitude (high tier) | 400 leaves, 390 to 510 elevation tiles, 46 to 57 MB | 240 leaves, 32 to 35 elevation tiles, about 8 MB |
+| iPhone under canopy at 300 m | 400 leaves, about 300 elevation tiles, 35 to 41 MB | 159 leaves, 18 to 26 elevation tiles, about 5 MB |
+
+What changed, all in one MiniMax run reviewed and landed as Task 13:
+
+- Imagery is draped on an elevation tile **two zooms coarser** (`ElevationGrid.elevationTileFor`, capped at zoom 12, 64 tiles kept). A 33-vertex mesh cannot use more than the 64 height samples such a tile has across it, and the height data outside the US is 30 m SRTM, which is zoom 12 at mid latitudes. This closes carry-over item 1 by a different route than the one proposed there.
+- Roots at zoom 7 (9 tiles instead of 25), imagery caps top out at zoom 17, grids are 33 vertices at zoom 14 and finer and 17 below.
+- The tiers carry a leaf budget: 96 / 160 / 240 leaves, tau 2.4 / 1.8 / 1.2, 192 / 256 / 384 textures. Phones, retina screens, touch screens and machines with four cores or fewer start on medium; only a plain-screen desktop starts high.
+- The decoded-tile cache holds 512 entries (each is 262 KB of RAM), down from 1024.
+- The exit pose is placed once a zoom-10 ground sample under the landing area exists and placed again for finer samples, never after the user has moved the camera.
+
+Not verified on a device: frame rate and load time on the phones. The desktop app's browser pane does not run `requestAnimationFrame` while the Claude window is covered, so it produced no timings this time; the numbers above come from the selection code, not from hardware.

@@ -127,6 +127,31 @@ describe('FreeCamera', () => {
     expect(free.pitch).toBeCloseTo(0, 6);
   });
 
+  it('remembers that the user has moved the camera', () => {
+    const { free, dom } = makeCamera();
+
+    expect(free.userMoved).toBe(false);
+
+    pointer(dom, 'pointerdown', 100, 100, 1);
+    expect(free.userMoved).toBe(true);
+
+    // The flag is never taken back: the user has been here.
+    pointer(dom, 'pointerup', 100, 100, 1);
+    expect(free.userMoved).toBe(true);
+  });
+
+  it('remembers that the user has moved the camera with the keyboard', () => {
+    const { free } = makeCamera();
+
+    expect(free.userMoved).toBe(false);
+
+    key('keydown', 'w');
+    expect(free.userMoved).toBe(true);
+
+    key('keyup', 'w');
+    expect(free.userMoved).toBe(true);
+  });
+
   it('lets go of its listeners when it is disposed', () => {
     const { free, dom } = makeCamera();
 

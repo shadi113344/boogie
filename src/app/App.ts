@@ -68,8 +68,24 @@ const HUD_INTERVAL_MS = 100;
 /** The window the mean terrain update time is taken over, in milliseconds. */
 const UPDATE_WINDOW_MS = 1000;
 
-/** The tiles the cache keeps: enough for a flight without a stall. */
-const CACHE_ENTRIES = 1024;
+/**
+ * The tiles the cache keeps: enough for a flight without a stall.
+ *
+ * A decoded tile is 256 KB of pixels or of heights, so this is the RAM of
+ * the phone: 512 tiles are 128 MB at the worst, and half of what the cache
+ * held before.
+ */
+const CACHE_ENTRIES = 512;
+
+/**
+ * The zoom at which the ground under the landing area is good enough to
+ * place the exit pose.
+ *
+ * A zoom-10 height tile is about a hundred metres across here: close
+ * enough to say how high the drop zone is, and coarse enough that the
+ * camera does not chase the noise of the height data.
+ */
+const EXIT_SAMPLE_ZOOM = 10;
 
 export class App {
   readonly renderer: Renderer;
@@ -129,16 +145,24 @@ export class App {
   /** How long each terrain update took, with the time it happened. */
   private readonly updateSamples: { t: number; ms: number }[] = [];
 
-  /** Whether the camera has been put at the exit height above the ground. */
-  private atExit = false;
+  /**
+   * The zoom of the elevation the exit pose was placed from, -1 for none.
+   *
+   * The exit pose is placed again for every finer sample of the ground, so
+   * the camera settles onto the ground as the ground is known better.
+   */
+  private exitSampleZoom = -1;
 
   constructor(canvas: HTMLCanvasElement, opts: AppOptions) {
     this.canvas = canvas;
     this.options = opts;
 
     // The tier the app starts on: the one that was asked for, or the one the
-    // device can be trusted with.
-    const tier = opts.quality ?? defaultTier(this.devicePixelRatio(), this.cores());
+    // device can be trusted with. A phone is never trusted with the high
+    // tier: it is the tier of a desktop.
+    const tier =
+      opts.quality ??
+      defaultTier(this.devicePixelRatio(), this.cores(), navigator.maxTouchPoints || 0);
     this.quality = new AdaptiveQuality(tier);
     // A tier that was asked for is the tier that stays.
     this.quality.locked = opts.quality !== undefined;
@@ -179,6 +203,7 @@ export class App {
           this.renderer.gl.capabilities.getMaxAnisotropy(),
         ),
         maxTextures: QUALITY[tier].maxTextures,
+        maxVisibleTiles: QUALITY[tier].maxLeaves,
       },
     );
 
@@ -253,7 +278,8 @@ export class App {
     this.measureUpdate(performance.now() - started, now);
 
     // The exit pose waits for the ground: the camera is put at the exit
-    // height above the landing area, once the elevation under it has arrived.
+    // height above the landing area, and put there again for every finer
+    // sample of the ground under it.
     this.placeAtExit();
 
     this.sky.update(this.camera.position);
@@ -327,8 +353,8 @@ export class App {
   /**
    * Take the tier the app is on.
    *
-   * The renderer draws fewer pixels, the terrain is less sharp and the
-   * imagery is filtered less.
+   * The renderer draws fewer pixels, the terrain is less sharp, the imagery
+   * is filtered less and there are fewer tiles of ground on screen.
    */
   private applyTier(tier: QualityTier): void {
     const settings = QUALITY[tier];
@@ -338,6 +364,7 @@ export class App {
       Math.min(settings.anisotropy, this.renderer.gl.capabilities.getMaxAnisotropy()),
     );
     this.terrain.setMaxTextures(settings.maxTextures);
+    this.terrain.setMaxVisibleTiles(settings.maxLeaves);
   }
 
   /**
@@ -345,15 +372,22 @@ export class App {
    *
    * The exit is a height above the ground, so the ground has to be known
    * first: the elevation under the landing area is asked for every frame
-   * until it arrives, and the camera is put at the exit once, when it does.
+   * until it arrives, and the camera is put at the exit when the ground is
+   * known well enough. The pose is placed again for every finer sample, so
+   * the camera settles onto the ground as the ground is known better.
+   *
+   * The user has the last word: once they have moved the camera, it is
+   * theirs and the app leaves it alone.
    */
   private placeAtExit(): void {
-    if (this.atExit) return;
+    if (this.freeCamera.userMoved) return;
 
     const sample = this.elevation.sample(this.options.dz.lz);
     if (!sample) return;
+    if (sample.zoom < EXIT_SAMPLE_ZOOM) return;
+    if (sample.zoom <= this.exitSampleZoom) return;
 
-    this.atExit = true;
+    this.exitSampleZoom = sample.zoom;
     this.goto(sample.height + exitAltitudeM(this.options.dz), EXIT_PITCH_RAD);
   }
 

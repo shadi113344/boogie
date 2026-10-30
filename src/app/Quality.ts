@@ -22,13 +22,15 @@ export interface QualitySettings {
   anisotropy: number;
   /** Imagery textures kept on the GPU at once. */
   maxTextures: number;
+  /** Tiles of ground on screen at once: the budget of the selection too. */
+  maxLeaves: number;
 }
 
 /** The numbers of the tiers. */
 export const QUALITY: Record<QualityTier, QualitySettings> = {
-  low: { maxPixelRatio: 1.0, tau: 2.0, anisotropy: 2, maxTextures: 256 },
-  medium: { maxPixelRatio: 1.5, tau: 1.4, anisotropy: 4, maxTextures: 384 },
-  high: { maxPixelRatio: 2.0, tau: 1.0, anisotropy: 8, maxTextures: 512 },
+  low: { maxPixelRatio: 1.0, tau: 2.4, anisotropy: 2, maxTextures: 192, maxLeaves: 96 },
+  medium: { maxPixelRatio: 1.5, tau: 1.8, anisotropy: 4, maxTextures: 256, maxLeaves: 160 },
+  high: { maxPixelRatio: 2.0, tau: 1.2, anisotropy: 8, maxTextures: 384, maxLeaves: 240 },
 };
 
 /** The tiers, from the richest to the cheapest. */
@@ -37,12 +39,17 @@ const LADDER: QualityTier[] = ['high', 'medium', 'low'];
 /**
  * The tier a device starts on.
  *
- * A dense screen and a small machine both start in the middle: the pixel
- * count of a three-times-density phone is the same as a two-times-density
- * desktop, and a slow phone is better off with fewer pixels.
+ * A phone never starts on the high tier: a touch screen, a dense screen and
+ * a small machine all put the app in the middle, where the ground is a little
+ * coarser and fewer tiles are on screen. The high tier is for the machines
+ * that ask for none of that.
  */
-export function defaultTier(dpr: number, hardwareConcurrency: number): QualityTier {
-  if (dpr >= 3 || hardwareConcurrency <= 4) return 'medium';
+export function defaultTier(
+  dpr: number,
+  hardwareConcurrency: number,
+  maxTouchPoints: number,
+): QualityTier {
+  if (dpr >= 2 || hardwareConcurrency <= 4 || maxTouchPoints > 0) return 'medium';
   return 'high';
 }
 

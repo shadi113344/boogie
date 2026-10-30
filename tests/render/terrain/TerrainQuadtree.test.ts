@@ -19,21 +19,21 @@ describe('TerrainQuadtree', () => {
   it('root tiles cover ±250 km', () => {
     const q = new TerrainQuadtree(frame, lz);
     const roots = q.rootTiles();
-    expect(roots.length).toBeGreaterThanOrEqual(25);
-    expect(roots.every((t) => t.z === 8)).toBe(true);
+    expect(roots.length).toBeGreaterThanOrEqual(9);
+    expect(roots.every((t) => t.z === 7)).toBe(true);
   });
 
   it('zoom caps follow distance from the landing area', () => {
-    expect(q.zoomCapAt(1000, 0)).toBe(18);
-    expect(q.zoomCapAt(3000, 0)).toBe(17);
+    expect(q.zoomCapAt(1000, 0)).toBe(17);
+    expect(q.zoomCapAt(3000, 0)).toBe(16);
     expect(q.zoomCapAt(20000, 0)).toBe(14);
     expect(q.zoomCapAt(200000, 0)).toBe(9);
   });
 
-  it('from exit altitude the tile under the camera is zoom 16', () => {
+  it('from exit altitude the tile under the camera is zoom 15', () => {
     const cam = { x: 0, y: 568 + 4115, z: 0, focalPx: 1462, ...down };
     const under = q.select(cam, flat).find((t) => containsLocal(frame, t, 0, 0));
-    expect(under?.z).toBe(16);
+    expect(under?.z).toBe(15);
   });
 
   it('tiles behind the camera stay at zoom 12 or coarser', () => {
@@ -48,9 +48,9 @@ describe('TerrainQuadtree', () => {
     expect(Math.max(...behind.map((t) => t.z))).toBeLessThanOrEqual(12);
   });
 
-  it('on final at 300 ft the tile under the camera is capped at zoom 18', () => {
+  it('on final at 300 ft the tile under the camera is capped at zoom 17', () => {
     const cam = { x: 800, y: 568 + 91, z: 0, focalPx: 1462, ...down };
-    expect(q.select(cam, flat).find((t) => containsLocal(frame, t, 800, 0))?.z).toBe(18);
+    expect(q.select(cam, flat).find((t) => containsLocal(frame, t, 800, 0))?.z).toBe(17);
   });
 
   it('50 km away never exceeds zoom 14', () => {
@@ -68,16 +68,22 @@ describe('TerrainQuadtree', () => {
   it('never returns more than maxLeaves, even for a 4K desktop', () => {
     for (const f of [1462, 2078, 4000]) {
       expect(q.select({ x: 0, y: 4683, z: 0, focalPx: f, ...down }, flat).length).toBeLessThanOrEqual(
-        400,
+        160,
       );
     }
   });
 
-  it('looking forward 30 degrees down from exit altitude keeps the ground 3 km ahead at zoom 15 or finer, within budget', () => {
+  it('looking forward 30 degrees down from exit altitude keeps the ground 3 km ahead at zoom 14, within budget', () => {
     const cam = { x: 0, y: 568 + 4115, z: 0, focalPx: 1462, dir: { x: 0, y: -0.5, z: -0.866 }, halfAngleRad: 0.6 };
     const leaves = q.select(cam, flat);
-    expect(leaves.length).toBeLessThanOrEqual(400);
-    expect(leaves.find(t => containsLocal(frame, t, 0, -3000))?.z).toBeGreaterThanOrEqual(15);
+    expect(leaves.length).toBeLessThanOrEqual(160);
+    // The budget is spent on the largest screen errors first, and the 160
+    // leaves run out on the fifty tiles that are closer to the camera: all
+    // of them have an error above 3.5. The tile three kilometres ahead has
+    // an error of 2.16, which is above tau as well, so it would be split
+    // too: it is the budget that stops it, and its texel of 6.6 m covers
+    // the 3.3 m the screen has there, so the imagery is a little soft.
+    expect(leaves.find(t => containsLocal(frame, t, 0, -3000))?.z).toBe(14);
   });
 
   it('spends the budget on the largest screen errors first', () => {
@@ -95,7 +101,7 @@ describe('TerrainQuadtree', () => {
     // exit altitude, so a tau above that must leave the whole root ring alone.
     const coarse = new TerrainQuadtree(frame, lz, { tau: 1000 });
     const cam = { x: 0, y: 568 + 4115, z: 0, focalPx: 1462, ...down };
-    expect(coarse.select(cam, flat).every(t => t.z === 8)).toBe(true);
+    expect(coarse.select(cam, flat).every(t => t.z === 7)).toBe(true);
   });
 });
 

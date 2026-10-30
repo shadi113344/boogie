@@ -322,23 +322,28 @@ describe('Terrain', () => {
 
   it('rebuilds heights when a finer elevation tile arrives', async () => {
     const spy = vi.spyOn(TerrainTile.prototype, 'rebuildHeights');
-    // A phone-sized budget: with the small default the selection stops at
-    // zoom 13 and no zoom-14 elevation is ever needed.
-    const fixture = makeTerrain(makeCache({ holdElevationZoom: 14 }), { maxVisibleTiles: 400 });
+    // The elevation is two zooms coarser than the imagery, so the finest
+    // elevation there is: the zoom-12 tile the fine tiles are draped on.
+    const fixture = makeTerrain(makeCache({ holdElevationZoom: 12 }), {
+      maxVisibleTiles: 400,
+      // Every tile of the selection is meshed in one go, so the ground under
+      // the camera is draped on the elevation that arrives.
+      maxBuildsPerUpdate: 200,
+    });
 
     fixture.terrain.update(cameraAt(0, 4683, 0));
     await settle(fixture.cache);
 
     // The coarse elevation has arrived, the fine one is still held.
+    expect(fixture.fetched.some((url) => isElevation(url) && zoomOf(url) === 5)).toBe(true);
     expect(fixture.fetched.some((url) => isElevation(url) && zoomOf(url) === 12)).toBe(true);
-    expect(fixture.fetched.some((url) => isElevation(url) && zoomOf(url) === 14)).toBe(true);
 
     // And now the fine one comes.
     fixture.releaseElevation();
     await settle(fixture.cache);
 
     const zooms = spy.mock.calls.map((call) => call[1]);
-    expect(zooms).toContain(14);
+    expect(zooms).toContain(12);
     spy.mockRestore();
   });
 
@@ -368,7 +373,9 @@ describe('Terrain', () => {
   });
 
   it('drapes the tiles over the heights of the ground', async () => {
-    const fixture = makeTerrain(makeCache());
+    // Every tile of the selection is meshed in one go: the ground under the
+    // camera is one of them, and it is the one that shows the height.
+    const fixture = makeTerrain(makeCache(), { maxBuildsPerUpdate: 200 });
 
     fixture.terrain.update(cameraAt(0, 4683, 0));
     await settle(fixture.cache);
@@ -414,7 +421,8 @@ describe('Terrain', () => {
       disposeDelayMs: 60_000,
     });
 
-    // The selection is forty tiles.
+    // The selection is thirty-nine tiles: a split takes one leaf and gives
+    // four, so the budget of forty leaves thirty-nine.
     fixture.terrain.quadtree.config.maxLeaves = 40;
 
     // The coarse ground first: from high above the drop zone the selection
@@ -458,8 +466,8 @@ describe('Terrain', () => {
       fixture.terrain.update(near);
     }
     const leaves = fixture.terrain.quadtree.select(near, (t) => fixture.terrain.heightRange(t));
-    expect(leaves.length).toBe(40);
-    expect(fixture.terrain.visibleTiles.length).toBe(40);
+    expect(leaves.length).toBe(39);
+    expect(fixture.terrain.visibleTiles.length).toBe(39);
     for (const drawnTile of fixture.terrain.visibleTiles) {
       expect(leaves.some((leaf) => tileKey(leaf) === tileKey(drawnTile))).toBe(true);
     }
@@ -476,6 +484,16 @@ describe('Terrain', () => {
 
     fixture.terrain.setAnisotropy(4);
     expect(fixture.terrain.quadtree.config.tau).toBe(2.5);
+  });
+
+  it('sets the number of visible tiles on the quadtree', async () => {
+    const fixture = makeTerrain(makeCache());
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    fixture.terrain.setMaxVisibleTiles(96);
+    expect(fixture.terrain.quadtree.config.maxLeaves).toBe(96);
   });
 
   it('keeps the texture of a built tile when the cache evicts it', async () => {
@@ -542,7 +560,9 @@ describe('Terrain', () => {
   });
 
   it('asks for no imagery until the elevation it is draped on has arrived', async () => {
-    const fixture = makeTerrain(makeCache({ holdElevationZoom: 14 }), { maxVisibleTiles: 400 });
+    // The elevation is two zooms coarser than the imagery, so the fine
+    // tiles are draped on the zoom-12 elevation, which is held back here.
+    const fixture = makeTerrain(makeCache({ holdElevationZoom: 12 }), { maxVisibleTiles: 400 });
 
     // From high above the drop zone the selection is the root ring, and the
     // elevation of that ring is coarse but enough to know the ground.
@@ -556,18 +576,21 @@ describe('Terrain', () => {
     await settle(fixture.cache);
 
     const leaves = fixture.terrain['desiredTiles'];
-    expect(leaves.some((tile: TileCoord) => tile.z === 16)).toBe(true);
-    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16)).toBe(false);
+    const fine = Math.max(...leaves.map((tile: TileCoord) => tile.z));
+    expect(fine).toBeGreaterThanOrEqual(14);
+    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === fine)).toBe(false);
 
     // The fine elevation arrives, and the imagery follows it.
     fixture.releaseElevation();
     await settle(fixture.cache);
 
-    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === 16)).toBe(true);
+    expect(fixture.fetched.some((url) => !isElevation(url) && zoomOf(url) === fine)).toBe(true);
   });
 
   it("requests the root ring's imagery while only the root elevation is loaded", async () => {
-    const fixture = makeTerrain(makeCache({ holdElevationAbove: 8 }), { maxVisibleTiles: 400 });
+    // The root ring is at zoom 7, and its elevation is two zooms coarser:
+    // everything finer than zoom 5 is held back.
+    const fixture = makeTerrain(makeCache({ holdElevationAbove: 5 }), { maxVisibleTiles: 400 });
 
     // Only the elevation of the root ring arrives: every finer elevation
     // tile is still on its way.
@@ -578,14 +601,14 @@ describe('Terrain', () => {
 
     // The root ring under the view is asked for, so the coarse ground is
     // covered while the fine elevation is still missing.
-    const root = lonLatToTile(frame.origin, 8);
+    const root = lonLatToTile(frame.origin, 7);
     const rootUrl = tileUrl(imageryProviderForZoom(root.z), root);
     expect(imagery).toContain(rootUrl);
 
     // Nothing finer is asked for: the ground it would be draped on is not
     // there yet.
     expect(imagery.some((url) => zoomOf(url) === 16)).toBe(false);
-    expect(imagery.every((url) => zoomOf(url) === 8)).toBe(true);
+    expect(imagery.every((url) => zoomOf(url) === 7)).toBe(true);
   });
 
   it('fills in finer fallbacks as finer elevation arrives', async () => {
@@ -672,8 +695,13 @@ describe('Terrain', () => {
     fixture.terrain.update(cameraAt(0, 700_000, 0));
     await settle(fixture.cache);
 
-    const root = lonLatToTile(frame.origin, 8);
-    const first = asked.filter((url) => isElevation(url) && url.includes(`/${root.z}/${root.x}/${root.y}`));
+    // The ring is draped on an elevation tile that is two zooms coarser.
+    const root = lonLatToTile(frame.origin, 7);
+    const elevationTile = fixture.elevation.elevationTileFor(root);
+    const first = asked.filter(
+      (url) =>
+        isElevation(url) && url.includes(`/${elevationTile.z}/${elevationTile.x}/${elevationTile.y}`),
+    );
     expect(first.length).toBe(1);
 
     // The grid fills up and throws the elevation tile away.
@@ -681,10 +709,10 @@ describe('Terrain', () => {
     for (let i = 0; i < 5; i++) {
       fixture.elevation.addTile({ z: 12, x: i, y: 4000 }, heights);
     }
-    expect(fixture.elevation.hasTile(root)).toBe(false);
+    expect(fixture.elevation.hasTile(elevationTile)).toBe(false);
 
     // The terrain has forgotten the height range of the tile as well.
-    expect(fixture.terrain['elevationRanges'].has(tileKey(root))).toBe(false);
+    expect(fixture.terrain['elevationRanges'].has(tileKey(elevationTile))).toBe(false);
 
     // The next update asks for the tile again.
     fixture.terrain.update(cameraAt(0, 700_000, 0));
@@ -707,9 +735,13 @@ describe('Terrain', () => {
     };
 
     // The grid holds the tile of the root ring already, so the terrain has
-    // no reason to ask for it.
-    const root = lonLatToTile(frame.origin, 8);
-    fixture.elevation.addTile(root, new Float32Array(TILE_SIZE * TILE_SIZE).fill(568));
+    // no reason to ask for it. The ring is draped on an elevation tile that
+    // is two zooms coarser.
+    const root = lonLatToTile(frame.origin, 7);
+    fixture.elevation.addTile(
+      fixture.elevation.elevationTileFor(root),
+      new Float32Array(TILE_SIZE * TILE_SIZE).fill(568),
+    );
 
     fixture.terrain.update(cameraAt(0, 700_000, 0));
     await settle(fixture.cache);
@@ -723,6 +755,11 @@ describe('Terrain', () => {
         elevationRamp: { tile: coarseTile, northM: RAMP_NORTH_M, southM: RAMP_SOUTH_M },
       }),
     );
+
+    // The ring is one tile, and it is draped on the ramp: the ramp is two
+    // zooms coarser than the ring it covers.
+    fixture.terrain.quadtree.config.rootZoom = 10;
+    fixture.terrain.quadtree.config.rootRadiusM = 1000;
 
     fixture.terrain.update(cameraAt(0, 4683, 0));
     await settle(fixture.cache);

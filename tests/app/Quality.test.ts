@@ -2,35 +2,44 @@ import { describe, it, expect } from 'vitest';
 import { AdaptiveQuality, QUALITY, defaultTier } from '@/app/Quality';
 
 describe('quality', () => {
-  it('defaultTier picks medium for dpr 3', () => {
-    expect(defaultTier(3, 8)).toBe('medium');
-    expect(defaultTier(2, 8)).toBe('high');
+  it('defaultTier picks medium for a dense screen', () => {
+    expect(defaultTier(3, 8, 5)).toBe('medium');
+    expect(defaultTier(2.625, 8, 5)).toBe('medium');
+    expect(defaultTier(2, 8, 0)).toBe('medium');
   });
 
   it('defaultTier picks medium for a small machine', () => {
-    expect(defaultTier(2, 4)).toBe('medium');
-    expect(defaultTier(2, 3)).toBe('medium');
-    expect(defaultTier(2, 5)).toBe('high');
+    expect(defaultTier(1, 4, 0)).toBe('medium');
+    expect(defaultTier(1, 3, 0)).toBe('medium');
+    expect(defaultTier(1, 5, 0)).toBe('high');
+  });
+
+  it('defaultTier picks medium for a touch screen', () => {
+    expect(defaultTier(1, 8, 10)).toBe('medium');
+    expect(defaultTier(1, 8, 0)).toBe('high');
   });
 
   it('holds the numbers of the tiers', () => {
     expect(QUALITY.low).toEqual({
       maxPixelRatio: 1.0,
-      tau: 2.0,
+      tau: 2.4,
       anisotropy: 2,
-      maxTextures: 256,
+      maxTextures: 192,
+      maxLeaves: 96,
     });
     expect(QUALITY.medium).toEqual({
       maxPixelRatio: 1.5,
-      tau: 1.4,
+      tau: 1.8,
       anisotropy: 4,
-      maxTextures: 384,
+      maxTextures: 256,
+      maxLeaves: 160,
     });
     expect(QUALITY.high).toEqual({
       maxPixelRatio: 2.0,
-      tau: 1.0,
+      tau: 1.2,
       anisotropy: 8,
-      maxTextures: 512,
+      maxTextures: 384,
+      maxLeaves: 240,
     });
   });
 

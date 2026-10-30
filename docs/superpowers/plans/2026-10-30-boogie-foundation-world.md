@@ -438,10 +438,8 @@ export interface LodConfig {
   maxZoom: number;          // 18
   rootRadiusM: number;      // 250000
   zoomCaps: ZoomCap[];
-  viewMarginRad: number;    // 0.35: tiles outside the view cone plus this margin are not refined
-  outOfViewMaxZoom: number; // 12
-  outOfViewTauMultiplier: number; // 4: a tile outside the view cone splits only while texelError > tau * this, so the back field stays a few dozen coarse tiles
-  maxLeaves: number;        // 400: if select would return more, tau is multiplied by 1.25 and selection repeated, up to four times
+  viewMarginRad: number;    // 0.35: tiles outside the view cone plus this margin are never refined (they stay at whatever zoom they left the cone)
+  maxLeaves: number;        // 400: the hard tile budget; refinement is best-first by texel error and stops when the budget is spent
 }
 export interface HeightRange { min: number; max: number }
 export class TerrainQuadtree {
@@ -452,12 +450,12 @@ export class TerrainQuadtree {
   distanceToTile(cam: LodCamera, t: TileCoord, h: HeightRange): number; // distance from camera to the tile's AABB (local x/z bounds, y from h), 0 inside
   inView(cam: LodCamera, t: TileCoord, h: HeightRange): boolean;        // true if the camera is inside the AABB, or the angle between dir and the vector to the nearest AABB point ≤ halfAngleRad + viewMarginRad
   texelError(cam: LodCamera, t: TileCoord, h: HeightRange): number;     // metersPerPixel(tileCentreLat, t.z) / max(dist, 1) * focalPx
-  select(cam: LodCamera, heightRange: (t: TileCoord) => HeightRange): TileCoord[]; // leaves: split while texelError > tau and z < min(maxZoom, zoomCapAt(tile centre), inView ? maxZoom : outOfViewMaxZoom); then the maxLeaves rule
+  select(cam: LodCamera, heightRange: (t: TileCoord) => HeightRange): TileCoord[]; // best-first: from rootTiles, repeatedly split the in-view leaf with the largest texelError while it is > tau and z < min(maxZoom, zoomCapAt(tile centre)), until no candidate remains or leaves + 3 > maxLeaves
 }
 export function computeRenderSet(desired: TileCoord[], isReady: (t: TileCoord) => boolean): TileCoord[]; // for each desired leaf walk up parents until a ready tile; dedupe by key; drop leaves with no ready ancestor
 ```
 
-Why the cone, the multiplier and the cap: at one texel per pixel, a phone looking straight down from 13,500 ft wants zoom 16 out to about 2.5 km and zoom 15 out to the edge of the cone, roughly 230 tiles in view; without the multiplier the tiles behind the camera would add several hundred more at zoom 12 (measured 946 in total during implementation), and the 400 cap would then coarsen the tile under the camera to zoom 14. With four texels per pixel allowed behind the camera the back field is about 40 tiles, the whole set about 270, and the cap only ever bites on large desktop screens, trading sharpness, never dropping ground.
+Why the cone, the budget and best-first order: measured during implementation, a phone looking straight down from 13,500 ft at one texel per pixel wants 388 leaves (148 at zoom 16, 175 at zoom 15, the rest coarse), while the normal freefall view 30° below the horizon wants more than 400 because zoom 12 is allowed out to 100 km and the view wedge reaches the horizon. A first version relaxed tau globally until the count fitted, which blurred the ground 3 km ahead to zoom 12 to save tiles at the horizon. Best-first refinement spends the budget where the screen error is largest, so the tile under the camera and the near field are always sharp and the budget cut only ever removes the splits that gained the least, at the far edge of each zoom ring. Tiles outside the cone never refine; the ancestor fallback in Task 10 means turning the camera shows coarse ground for a second rather than a hole.
 
 - [ ] **Step 1: Write the failing tests** (frame at Interlaken, lz at (0,0), flat heights `{min: 568, max: 568}`; `down = { dir: { x: 0, y: -1, z: 0 }, halfAngleRad: 0.6 }`; `focalPx 1462`, which is a 1,688 px tall render at 60° vertical field of view, an iPhone at pixel ratio 2)
 

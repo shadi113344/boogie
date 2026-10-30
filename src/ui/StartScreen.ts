@@ -21,7 +21,7 @@ export type TiltPermissionRequester = () => Promise<TiltPermission>;
 /** The key the chosen scheme is remembered under. */
 const SCHEME_KEY = 'boogie.controlScheme';
 
-/** The names the choice may be found under, so an older spelling is not lost. */
+/** The keys the choice is read back from. */
 const SCHEME_KEYS = [SCHEME_KEY];
 
 /** What the jumper is told when the sensor is not available. */

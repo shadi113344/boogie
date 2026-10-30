@@ -40,6 +40,8 @@ export interface TerrainOptions {
   maxVisibleTiles?: number;
   /** How long a tile may stay out of view before its mesh is disposed. */
   disposeDelayMs?: number;
+  /** Meshes built per update, so a burst of tiles does not stall a frame. */
+  maxBuildsPerUpdate?: number;
 }
 
 /**
@@ -51,6 +53,7 @@ export const DEFAULT_TERRAIN_OPTIONS: Required<TerrainOptions> = {
   maxTextures: 512,
   maxVisibleTiles: 400,
   disposeDelayMs: 2000,
+  maxBuildsPerUpdate: 8,
 };
 
 /** The height range used while no elevation has arrived, in metres. */
@@ -117,6 +120,15 @@ export class Terrain {
 
   private desiredTiles: TileCoord[] = [];
 
+  /** The camera of the last update: the priority of the requests and the order of the builds. */
+  private lastCam: LodCamera | null = null;
+
+  /** The distance from the camera to every desired tile, by tile key. */
+  private readonly distances = new Map<string, number>();
+
+  /** The meshes built since the last update: the build budget of the frame. */
+  private buildsSinceUpdate = 0;
+
   constructor(
     world: THREE.Group,
     frame: LocalFrame,
@@ -137,6 +149,7 @@ export class Terrain {
       maxTextures: opts.maxTextures ?? DEFAULT_TERRAIN_OPTIONS.maxTextures,
       maxVisibleTiles: opts.maxVisibleTiles ?? DEFAULT_TERRAIN_OPTIONS.maxVisibleTiles,
       disposeDelayMs: opts.disposeDelayMs ?? DEFAULT_TERRAIN_OPTIONS.disposeDelayMs,
+      maxBuildsPerUpdate: opts.maxBuildsPerUpdate ?? DEFAULT_TERRAIN_OPTIONS.maxBuildsPerUpdate,
     };
     this.heightAt = (x, z) => this.elevation.groundY(x, z);
 
@@ -158,20 +171,73 @@ export class Terrain {
    */
   update(cam: LodCamera): void {
     const now = Date.now();
+    this.lastCam = cam;
+    this.buildsSinceUpdate = 0;
+
     this.desiredTiles = this.quadtree.select(cam, (t) => this.heightRange(t));
 
+    // The distance to every desired tile: the priority of the requests and
+    // the order of the builds.
+    this.distances.clear();
     for (const coord of this.desiredTiles) {
+      this.distances.set(tileKey(coord), this.distanceTo(cam, coord));
+    }
+
+    this.requestMissing(cam, now);
+    this.refreshVisible(now);
+  }
+
+  /**
+   * The desired tiles, nearest to the camera first.
+   *
+   * The requests go out in this order, so the ground under the camera
+   * arrives first and is the first to be drawn.
+   */
+  private nearestFirst(): TileCoord[] {
+    return [...this.desiredTiles].sort(
+      (a, b) => this.distanceOf(a) - this.distanceOf(b),
+    );
+  }
+
+  /**
+   * The distance from the camera to a tile, in metres.
+   *
+   * The desired tiles are measured once per update; the ancestors that stand
+   * in for them are measured when they are needed.
+   */
+  private distanceOf(coord: TileCoord): number {
+    const known = this.distances.get(tileKey(coord));
+    if (known !== undefined) return known;
+    const cam = this.lastCam;
+    return cam === null ? 0 : this.distanceTo(cam, coord);
+  }
+
+  /**
+   * Ask for what is missing: the elevation of every desired tile and, once
+   * the ground under a tile is known, its imagery.
+   *
+   * The imagery of a tile whose ground is not known yet is not asked for:
+   * without the heights there is nothing to drape the tile on, and the
+   * selection is about to change anyway. The elevation tiles are coarse and
+   * few, so the ground is known one round trip later and the imagery can
+   * follow. The fallback of such a tile waits as well, for the same reason:
+   * the parent is only worth asking for once the ground is there.
+   */
+  private requestMissing(cam: LodCamera, now: number): void {
+    const nearest = this.nearestFirst();
+
+    for (const coord of nearest) {
       this.requestElevation(coord, cam, now);
+      if (!this.coveringElevation(coord)) continue;
       this.requestImagery(coord, cam, now);
     }
 
     // The parent of every leaf, so a leaf that is not ready has something to
     // fall back on while its own imagery is still on the way.
-    for (const coord of this.desiredTiles) {
+    for (const coord of nearest) {
+      if (!this.coveringElevation(coord)) continue;
       this.requestFallback(coord, cam, now);
     }
-
-    this.refreshVisible(now);
   }
 
   /**
@@ -180,13 +246,35 @@ export class Terrain {
    * A leaf that has no imagery falls back to the nearest ancestor that has,
    * so the ground is never missing: a tile that is slow or that has failed
    * leaves its parent's texture on screen.
+   *
+   * Only a few meshes are built per call, the nearest to the camera first,
+   * so a hundred tiles that arrive together do not stall a frame. A tile
+   * whose mesh is not built yet falls back to its nearest ancestor that has
+   * one, exactly as a tile that has not arrived at all does.
    */
   private refreshVisible(now: number): void {
     this.visibleTiles.length = 0;
-    for (const coord of computeRenderSet(this.desiredTiles, (t) => this.isReady(t))) {
-      this.visibleTiles.push(coord);
+
+    // The tiles that have imagery: the ones that can have a mesh.
+    const ready = computeRenderSet(this.desiredTiles, (t) => this.isReady(t));
+
+    // The meshes that are missing, nearest to the camera first.
+    const missing = ready
+      .filter((coord) => !this.hasMesh(coord))
+      .sort((a, b) => this.distanceOf(a) - this.distanceOf(b));
+
+    const budget = Math.max(0, this.options.maxBuildsPerUpdate - this.buildsSinceUpdate);
+    for (const coord of missing.slice(0, budget)) {
       this.ensureMesh(coord, now);
+      this.buildsSinceUpdate++;
     }
+
+    // The tiles that are on screen: the ones that have a mesh. The others
+    // fall back to their nearest ancestor that has one.
+    for (const coord of computeRenderSet(this.desiredTiles, (t) => this.hasMesh(t))) {
+      this.visibleTiles.push(coord);
+    }
+
     this.enforceBudget(now);
   }
 
@@ -322,19 +410,26 @@ export class Terrain {
    *
    * The parent is asked for, and only when the parent has failed in turn is
    * the grandparent asked for, so a tile that never arrives walks up the tree
-   * one level at a time instead of asking for the whole chain at once.
+   * one level at a time instead of asking for the whole chain at once. The
+   * walk stops at the root ring of the quadtree: below it there is nothing
+   * but the ring itself.
+   *
+   * The elevation of the ancestor is always asked for: it is what tells the
+   * terrain how high the ground is under the tile that is still on its way.
+   * The imagery of the ancestor waits for that ground.
    */
   private requestFallback(leaf: TileCoord, cam: LodCamera, now: number): void {
+    const rootZoom = this.quadtree.config.rootZoom;
     let ancestor = parentTile(leaf);
-    while (ancestor) {
+    while (ancestor && ancestor.z >= rootZoom) {
       const url = this.imageryUrlFor(ancestor);
       if (this.textures.has(url)) return;
       if (this.pending.has(url)) return;
 
       const failedAt = this.failed.get(url);
       if (failedAt === undefined || now - failedAt >= RETRY_AFTER_MS) {
-        this.requestImagery(ancestor, cam, now);
         this.requestElevation(ancestor, cam, now);
+        if (this.coveringElevation(ancestor)) this.requestImagery(ancestor, cam, now);
         return;
       }
       ancestor = parentTile(ancestor);
@@ -387,6 +482,11 @@ export class Terrain {
       if (!overlaps(state.bounds, bounds)) continue;
       state.tile.rebuildHeights(this.heightAt, coord.z);
     }
+
+    // The ground is known now, so the imagery of the tiles it covers can be
+    // asked for: they were held back while the heights were missing.
+    const cam = this.lastCam;
+    if (cam) this.requestMissing(cam, Date.now());
   }
 
   /** Build the mesh of a tile, if it has imagery and no mesh yet. */
@@ -536,6 +636,12 @@ export class Terrain {
   private isReady(coord: TileCoord): boolean {
     const state = this.tiles.get(tileKey(coord));
     return state !== undefined && this.textures.has(state.imageryUrl);
+  }
+
+  /** Whether a tile has a mesh of its own on the screen. */
+  private hasMesh(coord: TileCoord): boolean {
+    const state = this.tiles.get(tileKey(coord));
+    return state !== undefined && state.tile !== null;
   }
 
   /**

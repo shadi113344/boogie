@@ -103,6 +103,18 @@ export class App {
 
   private lastDebugAt = 0;
 
+  /** The time the terrain update took, summed over the current window. */
+  private updateMsTotal = 0;
+
+  /** The number of terrain updates in the current window. */
+  private updateMsCount = 0;
+
+  /** The mean duration of the terrain update over the last second. */
+  private updateMsAvg = 0;
+
+  /** When the current window began, in frame time. */
+  private updateWindowStart = Number.NaN;
+
   constructor(canvas: HTMLCanvasElement, opts: AppOptions) {
     this.canvas = canvas;
     this.options = opts;
@@ -160,6 +172,12 @@ export class App {
       this.frame(now);
     });
 
+    // The debug handle: the terrain and the frame timings are one console
+    // line away, without a build of the app.
+    if (opts.debug) {
+      (window as unknown as { __boogie?: unknown }).__boogie = this;
+    }
+
     this.resize();
     window.addEventListener('resize', this.onResize);
   }
@@ -178,7 +196,10 @@ export class App {
     // The world is rebased first: everything after it works with the camera's
     // true position in the local frame.
     this.floatingOrigin.update(this.camera);
+
+    const started = performance.now();
     this.terrain.update(this.lodCamera(this.floatingOrigin.truePosition(this.camera)));
+    this.measureUpdate(performance.now() - started, now);
 
     this.sky.update(this.camera.position);
     this.atmosphere.setCameraY(this.camera.position.y);
@@ -193,10 +214,30 @@ export class App {
         `[boogie] ${stats.fps.toFixed(0)} fps, ${stats.frameMs.toFixed(1)} ms, ` +
           `${info.calls} calls, ${info.triangles} triangles, ` +
           `tiles ${tiles.visible}/${tiles.desired} shown, ${tiles.pending} pending, ` +
+          `update ${this.updateMsAvg.toFixed(1)} ms, ` +
           `camera ${this.camera.position.y.toFixed(0)} m, ` +
           `sun ${this.atmosphere.uniforms.uSunDir.value.toArray().map((n) => n.toFixed(2)).join(', ')}`,
       );
     }
+  }
+
+  /**
+   * Keep the mean duration of the terrain update over the last second.
+   *
+   * The window is a second long, the same as the debug line, so the number
+   * on the console is the average of the frames it reports.
+   */
+  private measureUpdate(elapsedMs: number, now: number): void {
+    this.updateMsTotal += elapsedMs;
+    this.updateMsCount += 1;
+
+    if (Number.isNaN(this.updateWindowStart)) this.updateWindowStart = now;
+    if (now - this.updateWindowStart < 1000) return;
+
+    this.updateMsAvg = this.updateMsCount > 0 ? this.updateMsTotal / this.updateMsCount : 0;
+    this.updateMsTotal = 0;
+    this.updateMsCount = 0;
+    this.updateWindowStart = now;
   }
 
   /**

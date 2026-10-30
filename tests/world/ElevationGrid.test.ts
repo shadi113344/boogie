@@ -161,4 +161,63 @@ describe('ElevationGrid', () => {
     expect(g.groundY(10000, 0)).toBeCloseTo(-7.85, 1);
     expect(g.groundY(0, 0)).toBe(0);
   });
+
+  it('samples ten thousand points in one tile the same as a grid that has to walk', () => {
+    const t = lonLatToTile(ORIGIN, 14);
+    const east = { z: 14, x: t.x + 1, y: t.y };
+
+    // One grid with the tile on its own: the tile that answered last time is
+    // the tile that answers now.
+    const cached = new ElevationGrid(frame);
+    cached.addTile(t, rampTile(14, t.x, t.y));
+
+    // Another grid with a second tile beside it, so the points of the first
+    // tile are answered by a walk through the zooms every time.
+    const walked = new ElevationGrid(frame);
+    walked.addTile(t, rampTile(14, t.x, t.y));
+    const eastHeights = new Float32Array(TILE * TILE);
+    for (let row = 0; row < TILE; row++) {
+      for (let col = 0; col < TILE; col++) eastHeights[row * TILE + col] = 1000 + col;
+    }
+    walked.addTile(east, eastHeights);
+
+    // Ten thousand points inside the tile, spread over it by a fixed
+    // sequence, so the run is the same every time.
+    const b = tileBoundsMercator(t);
+    const e = tileBoundsMercator(east);
+    let seed = 20241013;
+    const next = (): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) | 0;
+      return (seed >>> 0) / 4294967296;
+    };
+
+    let worst = 0;
+    let zooms = new Set<number>();
+    for (let i = 0; i < 10_000; i++) {
+      const mx = b.minX + (b.maxX - b.minX) * (0.001 + 0.998 * next());
+      const my = b.minY + (b.maxY - b.minY) * (0.001 + 0.998 * next());
+      const point = mercatorToLonLat(mx, my);
+
+      const here = cached.sample(point);
+
+      // A point of the other tile in between, so the remembered tile is of
+      // no use when the next point is asked for.
+      walked.sample(
+        mercatorToLonLat(
+          e.minX + (e.maxX - e.minX) * (0.001 + 0.998 * next()),
+          e.minY + (e.maxY - e.minY) * (0.001 + 0.998 * next()),
+        ),
+      );
+
+      const there = walked.sample(point);
+      zooms.add(here?.zoom ?? -1);
+      zooms.add(there?.zoom ?? -1);
+      worst = Math.max(worst, Math.abs((here?.height ?? 0) - (there?.height ?? 0)));
+    }
+
+    // The remembered tile does not change the answer, and the answer comes
+    // from the tile the point is in.
+    expect([...zooms]).toEqual([14]);
+    expect(worst).toBe(0);
+  });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Group } from 'three';
-import { LocalFrame } from '@/world/geo';
+import { LocalFrame, parentTile, tileKey } from '@/world/geo';
+import type { TileCoord } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
 import { TileCache } from '@/world/TileCache';
 import type { Atmosphere } from '@/render/Atmosphere';
@@ -66,14 +67,28 @@ interface CacheFixture {
  *
  * The stubbed seams carry the URL of the tile in the body of the blob, so the
  * decoders know which tile they are working on: the imagery of one zoom can
- * be made to hang and one elevation tile can be held back.
+ * be made to hang and the elevation of one zoom, or of every zoom above a
+ * given one, can be held back.
  */
-function makeCache(opts: { hangImageZoom?: number; holdElevationZoom?: number } = {}): CacheFixture {
+function makeCache(
+  opts: {
+    hangImageZoom?: number;
+    holdElevationZoom?: number;
+    holdElevationAbove?: number;
+  } = {},
+): CacheFixture {
   const fetched: string[] = [];
   let releaseElevation = (): void => {};
   const elevationGate = new Promise<void>((resolve) => {
     releaseElevation = resolve;
   });
+
+  /** The zooms whose elevation is held back. */
+  const heldZooms = new Set<number>();
+  if (opts.holdElevationZoom !== undefined) heldZooms.add(opts.holdElevationZoom);
+  if (opts.holdElevationAbove !== undefined) {
+    for (let z = opts.holdElevationAbove + 1; z <= 20; z++) heldZooms.add(z);
+  }
 
   const fetchFn = async (input: RequestInfo | URL): Promise<Response> => {
     const url = String(input);
@@ -94,7 +109,7 @@ function makeCache(opts: { hangImageZoom?: number; holdElevationZoom?: number } 
     blob: Blob,
   ): Promise<{ data: Uint8ClampedArray; width: number; height: number }> => {
     const url = await blob.text();
-    if (opts.holdElevationZoom !== undefined && zoomOf(url) === opts.holdElevationZoom) {
+    if (heldZooms.has(zoomOf(url))) {
       await elevationGate;
     }
     return { data: terrariumPixels(), width: TILE_SIZE, height: TILE_SIZE };
@@ -128,20 +143,33 @@ interface Fixture extends CacheFixture {
 /** A terrain over a fake world, streaming into the given cache. */
 function makeTerrain(
   cacheFixture: CacheFixture,
-  opts: { maxVisibleTiles?: number } = {},
+  opts: {
+    maxVisibleTiles?: number;
+    maxBuildsPerUpdate?: number;
+    disposeDelayMs?: number;
+  } = {},
 ): Fixture {
   const world = new Group();
   const elevation = new ElevationGrid(frame);
-  const terrain = new Terrain(
-    world,
-    frame,
-    lz,
-    elevation,
-    cacheFixture.cache,
-    atmo,
-    { maxVisibleTiles: opts.maxVisibleTiles ?? 60 },
-  );
+  const terrain = new Terrain(world, frame, lz, elevation, cacheFixture.cache, atmo, {
+    maxVisibleTiles: opts.maxVisibleTiles ?? 60,
+    maxBuildsPerUpdate: opts.maxBuildsPerUpdate,
+    disposeDelayMs: opts.disposeDelayMs,
+  });
   return { ...cacheFixture, terrain, world };
+}
+
+/**
+ * Whether a tile is on screen: either it is drawn itself, or one of its
+ * ancestors stands in for it.
+ */
+function coveredBy(drawn: Set<string>, tile: TileCoord): boolean {
+  let t: TileCoord | null = tile;
+  while (t !== null) {
+    if (drawn.has(tileKey(t))) return true;
+    t = parentTile(t);
+  }
+  return false;
 }
 
 describe('Terrain', () => {
@@ -249,6 +277,82 @@ describe('Terrain', () => {
       }
     }
     expect(highest).toBeCloseTo(568, 0);
+  });
+
+  it('asks for no imagery until the ground is known', async () => {
+    const fixture = makeTerrain(makeCache({ holdElevationAbove: 0 }));
+
+    // The ground is not known, so only the elevation is asked for: there is
+    // nothing to drape the imagery on yet.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    expect(fixture.fetched.length).toBeGreaterThan(0);
+    expect(fixture.fetched.every((url) => isElevation(url))).toBe(true);
+
+    // The ground arrives, and the imagery follows it.
+    fixture.releaseElevation();
+    await settle(fixture.cache);
+
+    expect(fixture.fetched.some((url) => !isElevation(url))).toBe(true);
+  });
+
+  it('builds at most maxBuildsPerUpdate meshes per update and keeps the ground covered', async () => {
+    const fixture = makeTerrain(makeCache(), {
+      maxVisibleTiles: 400,
+      maxBuildsPerUpdate: 8,
+      disposeDelayMs: 60_000,
+    });
+
+    // The selection is forty tiles.
+    fixture.terrain.quadtree.config.maxLeaves = 40;
+
+    // The coarse ground first: from high above the drop zone the selection
+    // is the root ring, and those tiles are the ancestors of the fine ones
+    // that follow.
+    const high = cameraAt(0, 700_000, 0);
+    for (let step = 0; step < 5; step++) {
+      fixture.terrain.update(high);
+      await settle(fixture.cache);
+    }
+    const coarse = fixture.terrain.stats().built;
+    expect(coarse).toBeGreaterThan(0);
+
+    // The camera comes down: the selection refines, and the fine tiles all
+    // arrive together.
+    const near = cameraAt(0, 4683, 0);
+    fixture.terrain.update(near);
+    await settle(fixture.cache);
+
+    // Only eight meshes are built, even though the whole selection is ready.
+    expect(fixture.terrain.stats().built - coarse).toBeLessThanOrEqual(8);
+
+    // The ground is still covered: every tile of the selection has itself or
+    // an ancestor among the drawn tiles.
+    const drawn = new Set(fixture.terrain.visibleTiles.map(tileKey));
+    expect(drawn.size).toBeGreaterThan(0);
+    for (const leaf of fixture.terrain.quadtree.select(near, (t) => fixture.terrain.heightRange(t))) {
+      expect(coveredBy(drawn, leaf)).toBe(true);
+    }
+
+    // Everything on screen has a mesh of its own: the tiles that have none
+    // yet fall back to an ancestor that has one.
+    const meshed = new Set(fixture.world.children.map((child) => child.name));
+    for (const drawnTile of fixture.terrain.visibleTiles) {
+      expect(meshed.has(`tile ${tileKey(drawnTile)}`)).toBe(true);
+    }
+
+    // Five updates later every tile of the selection has a mesh of its own:
+    // the drawn tiles are then the leaves themselves.
+    for (let step = 0; step < 5; step++) {
+      fixture.terrain.update(near);
+    }
+    const leaves = fixture.terrain.quadtree.select(near, (t) => fixture.terrain.heightRange(t));
+    expect(leaves.length).toBe(40);
+    expect(fixture.terrain.visibleTiles.length).toBe(40);
+    for (const drawnTile of fixture.terrain.visibleTiles) {
+      expect(leaves.some((leaf) => tileKey(leaf) === tileKey(drawnTile))).toBe(true);
+    }
   });
 
   it('sets tau on the quadtree and anisotropy on the textures', async () => {

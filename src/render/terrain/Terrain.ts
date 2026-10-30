@@ -17,7 +17,7 @@
  */
 
 import * as THREE from 'three';
-import { parentTile, tileKey } from '../../world/geo';
+import { metersPerPixel, parentTile, tileKey } from '../../world/geo';
 import type { LocalFrame, TileCoord } from '../../world/geo';
 import type { ElevationGrid } from '../../world/ElevationGrid';
 import { TileFetchError } from '../../world/TileCache';
@@ -62,6 +62,32 @@ const UNKNOWN_RANGE: HeightRange = { min: 0, max: 5000 };
 
 /** How long a failed tile is left alone before it is asked for again, in ms. */
 const RETRY_AFTER_MS = 30_000;
+
+/** The smallest pad on a height range that was sampled from a coarse tile, in metres. */
+const MIN_SAMPLED_PAD_M = 100;
+
+/** The share of a coarse pixel's relief that the pad has to cover. */
+const SAMPLED_PAD_SHARE = 0.6;
+
+/** Where the ground is sampled inside a tile: the corners and the middle. */
+const SAMPLE_STEPS = [0, 0.5, 1];
+
+/**
+ * A height range that was sampled from a coarser elevation tile.
+ *
+ * The covering tile is named so that the range is only reused while the same
+ * elevation answers for it.
+ */
+interface SampledRange {
+  /** The tile the range belongs to. */
+  coord: TileCoord;
+
+  /** The elevation tile the range was sampled from. */
+  coveringKey: string;
+
+  /** The range itself. */
+  range: HeightRange;
+}
 
 /** The state of one terrain tile. */
 interface TileState {
@@ -113,6 +139,9 @@ export class Terrain {
   /** The height range of every elevation tile that has arrived, by tile key. */
   private readonly elevationRanges = new Map<string, HeightRange>();
 
+  /** The height ranges that were sampled from a coarser tile, by tile key. */
+  private readonly sampledRanges = new Map<string, SampledRange>();
+
   /** The imagery textures, by URL. */
   private readonly textures = new Map<string, THREE.Texture>();
 
@@ -123,6 +152,9 @@ export class Terrain {
 
   /** The camera of the last update: the priority of the requests and the order of the builds. */
   private lastCam: LodCamera | null = null;
+
+  /** True while nothing is known about the ground and only the root ring is wanted. */
+  private rootRingOnly = false;
 
   /** The distance from the camera to every desired tile, by tile key. */
   private readonly distances = new Map<string, number>();
@@ -184,7 +216,13 @@ export class Terrain {
     this.lastCam = cam;
     this.buildsSinceUpdate = 0;
 
-    this.desiredTiles = this.quadtree.select(cam, (t) => this.heightRange(t));
+    // Before any elevation has arrived nothing can be placed, so only the root
+    // ring is wanted: its elevation tiles are the few that every later
+    // selection needs first, and the near field is not refined blind.
+    this.rootRingOnly = this.elevation.tileCount() === 0;
+    this.desiredTiles = this.rootRingOnly
+      ? this.quadtree.rootTiles()
+      : this.quadtree.select(cam, (t) => this.heightRange(t));
 
     // The distance to every desired tile: the priority of the requests and
     // the order of the builds.
@@ -354,17 +392,92 @@ export class Terrain {
   }
 
   /**
-   * The height range of a tile, from the elevation tile that covers it.
+   * The height range of a tile.
+   *
+   * A tile whose own elevation tile has arrived has the exact range of that
+   * tile. A tile that is still covered by a coarser elevation tile gets the
+   * range of the ground under it, sampled from that coarse tile: the coarse
+   * tile says nothing about the relief of the small one, and a range that
+   * spans the whole coarse tile puts the camera inside the box of every tile
+   * below it, which makes the quadtree refine far past what the screen can
+   * show.
    *
    * Before any elevation has arrived the range is a guess: from sea level to
    * five thousand metres, which is as good as any until the ground is known.
    */
   heightRange(t: TileCoord): HeightRange {
+    const needed = this.elevation.elevationTileFor(t);
+    if (this.elevation.hasTile(needed)) {
+      const range = this.elevationRanges.get(tileKey(needed));
+      if (range) return { min: range.min, max: range.max };
+      return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
+    }
+
     const covering = this.coveringElevation(t);
     if (!covering) return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
-    const range = this.elevationRanges.get(tileKey(covering));
-    if (!range) return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
-    return { min: range.min, max: range.max };
+    return this.sampledHeightRange(t, covering);
+  }
+
+  /**
+   * The height range of a tile that is still covered by a coarser tile.
+   *
+   * The ground under the tile is sampled from the coarse tile, so the range
+   * is the relief of the tile itself and not the relief of the whole coarse
+   * tile. The samples are padded by the relief that one coarse pixel can
+   * hide, so ground that is a little higher or lower than the samples still
+   * fits inside the box.
+   *
+   * The range is kept until the covering tile changes: the ground under a
+   * tile does not change while the same elevation answers for it.
+   */
+  private sampledHeightRange(t: TileCoord, covering: TileCoord): HeightRange {
+    const key = tileKey(t);
+    const coveringKey = tileKey(covering);
+
+    const cached = this.sampledRanges.get(key);
+    if (cached && cached.coveringKey === coveringKey) return cached.range;
+
+    const bounds = this.frame.tileBoundsLocal(t);
+    let min = Infinity;
+    let max = -Infinity;
+    for (const fz of SAMPLE_STEPS) {
+      for (const fx of SAMPLE_STEPS) {
+        const x = bounds.minX + (bounds.maxX - bounds.minX) * fx;
+        const z = bounds.minZ + (bounds.maxZ - bounds.minZ) * fz;
+        const height = this.elevation.sampleLocal(x, z);
+        if (height < min) min = height;
+        if (height > max) max = height;
+      }
+    }
+
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+      return { min: UNKNOWN_RANGE.min, max: UNKNOWN_RANGE.max };
+    }
+
+    const pad = this.sampledPad(t, covering);
+    const range: HeightRange = { min: min - pad, max: max + pad };
+    this.sampledRanges.set(key, { coord: t, coveringKey, range });
+    return range;
+  }
+
+  /**
+   * The pad on a height range that was sampled from a coarse tile.
+   *
+   * The pad covers the relief that one pixel of the coarse tile can hide, so
+   * the box is wide enough for the ground the samples missed.
+   */
+  private sampledPad(t: TileCoord, covering: TileCoord): number {
+    const lat = this.tileCentreLat(t);
+    return Math.max(MIN_SAMPLED_PAD_M, SAMPLED_PAD_SHARE * metersPerPixel(lat, covering.z));
+  }
+
+  /** The latitude of the middle of a tile, where the ground resolution is measured. */
+  private tileCentreLat(t: TileCoord): number {
+    const bounds = this.frame.tileBoundsLocal(t);
+    return this.frame.toLonLat(
+      (bounds.minX + bounds.maxX) / 2,
+      (bounds.minZ + bounds.maxZ) / 2,
+    ).lat;
   }
 
   /** What the terrain is doing, for the debug overlay. */
@@ -427,6 +540,7 @@ export class Terrain {
     this.textures.clear();
     this.textureOrder.clear();
     this.elevationRanges.clear();
+    this.sampledRanges.clear();
   }
 
   /** The URL of the imagery of a tile. */
@@ -579,6 +693,10 @@ export class Terrain {
     }
     this.elevationRanges.set(tileKey(coord), { min, max });
 
+    // The ranges that were sampled under this tile are stale now: the ground
+    // they describe is known better.
+    this.dropSampledRanges(coord);
+
     // Every tile this elevation covers is draped over it again, unless it is
     // already draped over something finer.
     const bounds = this.frame.tileBoundsLocal(coord);
@@ -592,7 +710,30 @@ export class Terrain {
     // The ground is known now, so the imagery of the tiles it covers can be
     // asked for: they were held back while the heights were missing.
     const cam = this.lastCam;
-    if (cam) this.requestMissing(cam, Date.now());
+    if (!cam) return;
+    if (this.rootRingOnly) {
+      // The first ground has arrived: select properly now rather than on the
+      // next frame, so a cold start loses no time.
+      this.update(cam);
+      return;
+    }
+    this.requestMissing(cam, Date.now());
+  }
+
+  /**
+   * Forget the height ranges that were sampled under a tile.
+   *
+   * The tiles the new elevation covers have their own range now, and the
+   * tiles that are still covered by a coarser tile are sampled again: the
+   * finer heights may say something different about the ground under them.
+   */
+  private dropSampledRanges(coord: TileCoord): void {
+    const bounds = this.frame.tileBoundsLocal(coord);
+    for (const [key, entry] of [...this.sampledRanges]) {
+      const tileBounds = this.frame.tileBoundsLocal(entry.coord);
+      if (!overlaps(tileBounds, bounds)) continue;
+      this.sampledRanges.delete(key);
+    }
   }
 
   /** Build the mesh of a tile, if it has imagery and no mesh yet. */

@@ -65,6 +65,9 @@ const EXIT_PITCH_RAD = -Math.PI / 3;
 /** How often the overlay is refreshed, in milliseconds. */
 const HUD_INTERVAL_MS = 100;
 
+/** The window the mean terrain update time is taken over, in milliseconds. */
+const UPDATE_WINDOW_MS = 1000;
+
 /** The tiles the cache keeps: enough for a flight without a stall. */
 const CACHE_ENTRIES = 1024;
 
@@ -120,17 +123,11 @@ export class App {
 
   private lastHudAt = 0;
 
-  /** The time the terrain update took, summed over the current window. */
-  private updateMsTotal = 0;
-
-  /** The number of terrain updates in the current window. */
-  private updateMsCount = 0;
-
   /** The mean duration of the terrain update over the last second. */
   private updateMsAvg = 0;
 
-  /** When the current window began, in frame time. */
-  private updateWindowStart = Number.NaN;
+  /** How long each terrain update took, with the time it happened. */
+  private readonly updateSamples: { t: number; ms: number }[] = [];
 
   /** Whether the camera has been put at the exit height above the ground. */
   private atExit = false;
@@ -411,20 +408,23 @@ export class App {
   /**
    * Keep the mean duration of the terrain update over the last second.
    *
-   * The window is a second long, the same as the debug line, so the number
-   * on the console is the average of the frames it reports.
+   * The window slides: every update is kept with the time it happened, the
+   * ones that fall out of the window are dropped, and the mean of what is
+   * left is the number the overlay shows. The average is therefore there
+   * from the first frame on, instead of only after a whole window has
+   * passed.
    */
   private measureUpdate(elapsedMs: number, now: number): void {
-    this.updateMsTotal += elapsedMs;
-    this.updateMsCount += 1;
+    this.updateSamples.push({ t: now, ms: elapsedMs });
 
-    if (Number.isNaN(this.updateWindowStart)) this.updateWindowStart = now;
-    if (now - this.updateWindowStart < 1000) return;
+    const cutoff = now - UPDATE_WINDOW_MS;
+    while (this.updateSamples.length > 0 && (this.updateSamples[0]?.t ?? 0) < cutoff) {
+      this.updateSamples.shift();
+    }
 
-    this.updateMsAvg = this.updateMsCount > 0 ? this.updateMsTotal / this.updateMsCount : 0;
-    this.updateMsTotal = 0;
-    this.updateMsCount = 0;
-    this.updateWindowStart = now;
+    let total = 0;
+    for (const sample of this.updateSamples) total += sample.ms;
+    this.updateMsAvg = this.updateSamples.length > 0 ? total / this.updateSamples.length : 0;
   }
 
   /**

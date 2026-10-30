@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Group, Texture } from 'three';
-import { LocalFrame, lonLatToTile, parentTile, tileKey } from '@/world/geo';
+import { LocalFrame, lonLatToTile, metersPerPixel, parentTile, tileKey } from '@/world/geo';
 import type { TileCoord } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
 import { TileCache, TileFetchError } from '@/world/TileCache';
@@ -20,6 +20,13 @@ const down = { dir: { x: 0, y: -1, z: 0 }, halfAngleRad: 0.6 };
 /** Edge length of a tile, in pixels. */
 const TILE_SIZE = 256;
 
+/** The coarse tile of the zoom-8 ring that holds the landing area. */
+const coarseTile = lonLatToTile(frame.origin, 8);
+
+/** The heights of the coarse tile: 500 m at its north edge, 4,500 m at its south edge. */
+const RAMP_NORTH_M = 500;
+const RAMP_SOUTH_M = 4500;
+
 function cameraAt(x: number, y: number, z: number): LodCamera {
   return { x, y, z, focalPx: 1462, ...down };
 }
@@ -33,6 +40,18 @@ function zoomOf(url: string): number {
 /** Whether a URL is for elevation rather than imagery. */
 function isElevation(url: string): boolean {
   return url.includes('/terrarium/');
+}
+
+/** The tile of an elevation URL, or null when the URL is not one. */
+function elevationTileOf(url: string): TileCoord | null {
+  const match = url.match(/\/terrarium\/(\d+)\/(\d+)\/(\d+)\.png/);
+  if (!match) return null;
+  return { z: Number(match[1]), x: Number(match[2]), y: Number(match[3]) };
+}
+
+/** Whether two tiles are the same one. */
+function sameTile(a: TileCoord, b: TileCoord): boolean {
+  return a.z === b.z && a.x === b.x && a.y === b.y;
 }
 
 /**
@@ -51,6 +70,45 @@ function terrariumPixels(height = 568): Uint8ClampedArray {
     data[i * 4 + 3] = 255;
   }
   return data;
+}
+
+/**
+ * A tile of heights that ramp from the north edge to the south edge, in the
+ * Terrarium encoding.
+ */
+function terrariumRampPixels(northM: number, southM: number): Uint8ClampedArray {
+  const data = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+  for (let y = 0; y < TILE_SIZE; y++) {
+    const height = Math.round(northM + ((southM - northM) * y) / (TILE_SIZE - 1));
+    const value = height + 32768;
+    const red = Math.floor(value / 256);
+    const green = value - red * 256;
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const i = (y * TILE_SIZE + x) * 4;
+      data[i] = red;
+      data[i + 1] = green;
+      data[i + 2] = 0;
+      data[i + 3] = 255;
+    }
+  }
+  return data;
+}
+
+/** The height of the ramp at a point of the local frame, in metres. */
+function rampHeightAt(z: number): number {
+  const bounds = frame.tileBoundsLocal(coarseTile);
+  const share = (z - bounds.minZ) / (bounds.maxZ - bounds.minZ);
+  return RAMP_NORTH_M + (RAMP_SOUTH_M - RAMP_NORTH_M) * share;
+}
+
+/** The pad the terrain puts on a height range sampled from the coarse tile. */
+function sampledPad(tile: TileCoord): number {
+  const bounds = frame.tileBoundsLocal(tile);
+  const lat = frame.toLonLat(
+    (bounds.minX + bounds.maxX) / 2,
+    (bounds.minZ + bounds.maxZ) / 2,
+  ).lat;
+  return Math.max(100, 0.6 * metersPerPixel(lat, coarseTile.z));
 }
 
 interface CacheFixture {
@@ -78,6 +136,17 @@ function makeCache(
     holdElevationAbove?: number;
     concurrency?: number;
     hangImageFetch?: boolean;
+    /**
+     * The one elevation tile that arrives: it ramps from `northM` at its
+     * north edge to `southM` at its south edge. Every other elevation tile
+     * is held back, so only the coarse ground is known.
+     */
+    elevationRamp?: { tile: TileCoord; northM: number; southM: number };
+    /**
+     * The elevation tiles come in one at a time, in the order they were
+     * asked for: the network is slow and the tiles arrive one by one.
+     */
+    elevationInOrder?: boolean;
   } = {},
 ): CacheFixture {
   const fetched: string[] = [];
@@ -85,6 +154,9 @@ function makeCache(
   const elevationGate = new Promise<void>((resolve) => {
     releaseElevation = resolve;
   });
+
+  /** The turn of every elevation tile: the next one waits for this one. */
+  let elevationTurn: Promise<void> = Promise.resolve();
 
   /** The zooms whose elevation is held back. */
   const heldZooms = new Set<number>();
@@ -117,6 +189,30 @@ function makeCache(
     blob: Blob,
   ): Promise<{ data: Uint8ClampedArray; width: number; height: number }> => {
     const url = await blob.text();
+    if (opts.elevationInOrder && isElevation(url)) {
+      // One tile at a time, in the order the tiles were asked for.
+      const turn = elevationTurn;
+      let done = (): void => {};
+      elevationTurn = new Promise<void>((resolve) => {
+        done = resolve;
+      });
+      await turn;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      done();
+    }
+    const ramp = opts.elevationRamp;
+    if (ramp) {
+      const tile = elevationTileOf(url);
+      if (!tile || !sameTile(tile, ramp.tile)) {
+        // Only the coarse tile arrives: the finer ground is still on its way.
+        await elevationGate;
+      }
+      return {
+        data: terrariumRampPixels(ramp.northM, ramp.southM),
+        width: TILE_SIZE,
+        height: TILE_SIZE,
+      };
+    }
     if (heldZooms.has(zoomOf(url))) {
       await elevationGate;
     }
@@ -157,6 +253,7 @@ function makeTerrain(
     maxBuildsPerUpdate?: number;
     disposeDelayMs?: number;
     elevationMaxTiles?: number;
+    tau?: number;
   } = {},
 ): Fixture {
   const world = new Group();
@@ -165,6 +262,7 @@ function makeTerrain(
     maxVisibleTiles: opts.maxVisibleTiles ?? 60,
     maxBuildsPerUpdate: opts.maxBuildsPerUpdate,
     disposeDelayMs: opts.disposeDelayMs,
+    tau: opts.tau,
   });
   return { ...cacheFixture, terrain, world, elevation };
 }
@@ -224,7 +322,9 @@ describe('Terrain', () => {
 
   it('rebuilds heights when a finer elevation tile arrives', async () => {
     const spy = vi.spyOn(TerrainTile.prototype, 'rebuildHeights');
-    const fixture = makeTerrain(makeCache({ holdElevationZoom: 14 }));
+    // A phone-sized budget: with the small default the selection stops at
+    // zoom 13 and no zoom-14 elevation is ever needed.
+    const fixture = makeTerrain(makeCache({ holdElevationZoom: 14 }), { maxVisibleTiles: 400 });
 
     fixture.terrain.update(cameraAt(0, 4683, 0));
     await settle(fixture.cache);
@@ -615,5 +715,100 @@ describe('Terrain', () => {
     await settle(fixture.cache);
 
     expect(asked.filter((url) => isElevation(url))).toEqual([]);
+  });
+
+  it('height range from a coarse tile follows the local ground', async () => {
+    const fixture = makeTerrain(
+      makeCache({
+        elevationRamp: { tile: coarseTile, northM: RAMP_NORTH_M, southM: RAMP_SOUTH_M },
+      }),
+    );
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The coarse ground has arrived and nothing finer has.
+    expect(fixture.elevation.hasTile(coarseTile)).toBe(true);
+    expect(fixture.elevation.tileCount()).toBe(1);
+
+    // A tile in the northern quarter of the coarse tile, where the ramp is
+    // low: its ground is known, even though its own elevation has not come.
+    const fine: TileCoord = { z: 14, x: coarseTile.x * 64 + 32, y: coarseTile.y * 64 + 8 };
+    expect(fixture.elevation.hasTile(fixture.elevation.elevationTileFor(fine))).toBe(false);
+
+    const range = fixture.terrain.heightRange(fine);
+    const pad = sampledPad(fine);
+    const fineBounds = frame.tileBoundsLocal(fine);
+    const local = rampHeightAt((fineBounds.minZ + fineBounds.maxZ) / 2);
+
+    // The range is the relief of the tile, not the relief of the coarse tile.
+    expect(range.max - range.min).toBeLessThan(700);
+    expect(range.min).toBeGreaterThan(RAMP_NORTH_M);
+    expect(range.max).toBeLessThan(RAMP_SOUTH_M);
+
+    // And it is centred on the ground that is really under the tile.
+    expect(Math.abs(range.min - local)).toBeLessThan(100 + pad);
+  });
+
+  it('the first selection does not over-refine while only coarse elevation is loaded', async () => {
+    const fixture = makeTerrain(
+      makeCache({
+        elevationRamp: { tile: coarseTile, northM: RAMP_NORTH_M, southM: RAMP_SOUTH_M },
+      }),
+      // The phone runs at the medium tier, where the ground is allowed to be
+      // a little coarser than on the high tier.
+      { maxVisibleTiles: 400, tau: 1.4 },
+    );
+
+    // The first pass asks for the ground; the coarse tile is the only one
+    // that arrives.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The selection settles on the coarse ground, and it does not refine
+    // past what the screen can show.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+
+    const desired = fixture.terrain['desiredTiles'] as TileCoord[];
+    expect(desired.length).toBeGreaterThan(0);
+    expect(Math.max(...desired.map((tile) => tile.z))).toBeLessThanOrEqual(16);
+    expect(fixture.terrain.stats().desired).toBeLessThan(400);
+  });
+
+  it('elevation requests stay bounded on a cold start', async () => {
+    const fixture = makeTerrain(
+      makeCache({ hangImageFetch: true, elevationInOrder: true }),
+      { maxVisibleTiles: 400 },
+    );
+
+    // The ground keeps arriving while the imagery hangs: the elevation grid
+    // must not fill up with the transient leaves of the settling selection.
+    let held = 0;
+    for (let step = 0; step < 20; step++) {
+      fixture.terrain.update(cameraAt(0, 4683, 0));
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      held = Math.max(held, fixture.elevation.tileCount());
+    }
+
+    expect(held).toBeLessThanOrEqual(96);
+  });
+
+  it('asks only for the root ring before any elevation has arrived', async () => {
+    const fixture = makeTerrain(
+      makeCache({ hangImageFetch: true, holdElevationAbove: 0 }),
+      { maxVisibleTiles: 400 },
+    );
+
+    // Nothing is known about the ground yet: the first update must not refine
+    // the near field blind and ask for the elevation of hundreds of leaves.
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+
+    const roots = fixture.terrain.quadtree.rootTiles().length;
+    expect(fixture.terrain.stats().desired).toBe(roots);
+    const pending = fixture.terrain['pending'] as Map<string, string>;
+    expect(pending.size).toBeLessThanOrEqual(roots);
+    expect([...pending.values()].every((kind) => kind === 'heights')).toBe(true);
+    expect(fixture.fetched.every(isElevation)).toBe(true);
   });
 });

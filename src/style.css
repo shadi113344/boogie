@@ -235,3 +235,113 @@ body {
   opacity: 0.7;
   pointer-events: none;
 }
+
+/* ---- the touch layer of the canopy ---- */
+
+.cn-controls {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.cn-controls[hidden] {
+  display: none;
+}
+
+/* The outer third of each side of the screen is that side's toggle. The
+   middle of the screen belongs to the jumper. */
+.cn-toggle {
+  position: absolute;
+  top: 0;
+  width: 30%;
+  height: 100%;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.cn-toggle-left {
+  left: 0;
+}
+
+.cn-toggle-right {
+  right: 0;
+}
+
+/* The thin line along the edge that shows how far the toggle is pulled. */
+.cn-depth {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.5);
+  transform: scaleY(0);
+  transform-origin: top center;
+  pointer-events: none;
+}
+
+.cn-depth-left {
+  left: 4px;
+}
+
+.cn-depth-right {
+  right: 4px;
+}
+
+/* The slider at the bottom: the symmetric brakes. */
+.cn-slider {
+  position: absolute;
+  left: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 20px;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.cn-slider-knob {
+  position: absolute;
+  left: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* The Fronts button and the two pills. */
+.cn-fronts,
+.cn-unstow,
+.cn-plf {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 14px;
+  font: 13px system-ui, -apple-system, sans-serif;
+  color: #fff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.cn-fronts {
+  position: absolute;
+  left: calc(16px + env(safe-area-inset-left));
+  bottom: calc(16px + env(safe-area-inset-bottom));
+}
+
+.cn-unstow {
+  position: absolute;
+  right: calc(16px + env(safe-area-inset-right));
+  bottom: calc(16px + env(safe-area-inset-bottom));
+}
+
+.cn-plf {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.cn-plf[hidden],
+.cn-unstow[hidden] {
+  display: none;
+}
+

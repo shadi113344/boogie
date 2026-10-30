@@ -1,5 +1,6 @@
 import './style.css';
 import { App } from '@/app/App';
+import type { QualityTier } from '@/app/Quality';
 import type { LonLat } from '@/world/geo';
 
 interface DropZoneLike {
@@ -33,7 +34,12 @@ function parseHour(raw: string | null): number {
   return Math.min(24, Math.max(0, hour));
 }
 
-function parseQuality(raw: string | null): 'low' | 'medium' | 'high' | undefined {
+/**
+ * The quality tier of the URL.
+ *
+ * A tier that is asked for is locked: the app does not step down from it.
+ */
+function parseQuality(raw: string | null): QualityTier | undefined {
   if (raw === 'low' || raw === 'medium' || raw === 'high') return raw;
   return undefined;
 }

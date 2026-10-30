@@ -588,10 +588,14 @@ export class Terrain {
   }
 
   /**
-   * The cache has thrown a tile away: the texture goes with it, and so do the
-   * meshes that were showing it, because their texture is gone.
+   * The cache has thrown a tile away.
+   *
+   * A texture that a built mesh is showing stays: three keeps the bitmap
+   * alive through the texture, so throwing the bitmap away frees nothing and
+   * only costs the mesh its ground. A texture that no mesh uses is freed.
    */
   private onEvict(url: string): void {
+    if (this.textureInUse(url)) return;
     this.disposeTexture(url);
   }
 

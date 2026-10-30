@@ -7,7 +7,65 @@
   </head>
   <body>
     <canvas id="view"></canvas>
-    <div id="ui"></div>
+    <div id="ui">
+      <div
+        id="camera-buttons"
+        style="
+          position: absolute;
+          right: 8px;
+          bottom: calc(8px + env(safe-area-inset-bottom));
+          display: flex;
+          gap: 6px;
+          pointer-events: auto;
+        "
+      >
+        <button
+          type="button"
+          data-pose="exit"
+          style="
+            font: 12px system-ui, sans-serif;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 6px;
+            padding: 8px 10px;
+            touch-action: manipulation;
+          "
+        >
+          13,500 ft
+        </button>
+        <button
+          type="button"
+          data-pose="low"
+          style="
+            font: 12px system-ui, sans-serif;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 6px;
+            padding: 8px 10px;
+            touch-action: manipulation;
+          "
+        >
+          1,000 ft
+        </button>
+        <button
+          type="button"
+          data-pose="ground"
+          style="
+            font: 12px system-ui, sans-serif;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 6px;
+            padding: 8px 10px;
+            touch-action: manipulation;
+          "
+        >
+          ground
+        </button>
+      </div>
+    </div>
     <div id="attribution">Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community · Sentinel-2 cloudless by EOX (CC BY-NC-SA 4.0) · Terrain: Mapzen / AWS Terrain Tiles</div>
     <script type="module" src="/src/main.ts"></script>
   </body>

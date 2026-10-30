@@ -12,9 +12,13 @@ import { Renderer } from '@/render/Renderer';
 import { Atmosphere } from '@/render/Atmosphere';
 import { Sky } from '@/render/Sky';
 import { FloatingOrigin } from '@/render/FloatingOrigin';
+import { FreeCamera } from '@/render/FreeCamera';
 import { Terrain } from '@/render/terrain/Terrain';
 import type { LodCamera } from '@/render/terrain/TerrainQuadtree';
+import { DebugHud } from '@/ui/DebugHud';
 import { Loop } from './Loop';
+import { AdaptiveQuality, QUALITY, defaultTier } from './Quality';
+import type { QualityTier } from './Quality';
 import { localDayInZone, localTimeToDate, sunDirectionLocal } from '@/world/sun';
 import { LocalFrame } from '@/world/geo';
 import type { LonLat } from '@/world/geo';
@@ -28,15 +32,18 @@ export interface AppOptions {
   hourLocal: number;
   /** Developer overlay and console logging. */
   debug: boolean;
-  /** Quality tier. Task 11 turns this into an adaptive tier. */
-  quality?: 'low' | 'medium' | 'high';
+  /** Quality tier. A given tier is locked; without one the tier adapts. */
+  quality?: QualityTier;
 }
 
 /** Height of the camera at the start: 13,500 ft above mean sea level. */
 const EXIT_ALTITUDE_M = 4115;
 
-/** Height of the landing area. A placeholder until the terrain arrives. */
-const LANDING_HEIGHT_M = 0;
+/** One thousand feet above mean sea level: the low pass over the drop zone. */
+const LOW_ALTITUDE_M = 305;
+
+/** The height above the ground the camera keeps, in metres. */
+const MIN_CLEARANCE_M = 2;
 
 /** Vertical field of view, in degrees. */
 const FOV_DEG = 60;
@@ -48,19 +55,11 @@ const FAR_M = 600000;
 /** Downward tilt at the start, in radians. */
 const START_PITCH_RAD = -Math.PI / 4;
 
-/** Pixel ratio cap per quality tier. Task 11 owns the tiers. */
-const PIXEL_RATIO_CAP: Record<'low' | 'medium' | 'high', number> = {
-  low: 1,
-  medium: 1.5,
-  high: 2,
-};
+/** How often the overlay is refreshed, in milliseconds. */
+const HUD_INTERVAL_MS = 100;
 
-/** Anisotropic filtering allowed per quality tier. */
-const ANISOTROPY_CAP: Record<'low' | 'medium' | 'high', number> = {
-  low: 2,
-  medium: 4,
-  high: 8,
-};
+/** The tiles the cache keeps: enough for a flight without a stall. */
+const CACHE_ENTRIES = 1024;
 
 export class App {
   readonly renderer: Renderer;
@@ -69,6 +68,12 @@ export class App {
   readonly atmosphere: Atmosphere;
   readonly sky: Sky;
   readonly loop: Loop;
+
+  /** The camera you fly with. */
+  readonly freeCamera: FreeCamera;
+
+  /** The tier of the app, and the watch on the frame times. */
+  readonly quality: AdaptiveQuality;
 
   /** The world the terrain lives in; the floating origin moves it. */
   readonly world: THREE.Group;
@@ -95,6 +100,9 @@ export class App {
 
   private readonly options: AppOptions;
 
+  /** The developer overlay, when the app was started in debug mode. */
+  private readonly hud: DebugHud | null = null;
+
   /** Scratch: the view direction of the camera, in world space. */
   private readonly viewDirection = new THREE.Vector3();
 
@@ -102,6 +110,8 @@ export class App {
   private readonly bufferSize = new THREE.Vector2();
 
   private lastDebugAt = 0;
+
+  private lastHudAt = 0;
 
   /** The time the terrain update took, summed over the current window. */
   private updateMsTotal = 0;
@@ -119,8 +129,15 @@ export class App {
     this.canvas = canvas;
     this.options = opts;
 
+    // The tier the app starts on: the one that was asked for, or the one the
+    // device can be trusted with.
+    const tier = opts.quality ?? defaultTier(this.devicePixelRatio(), this.cores());
+    this.quality = new AdaptiveQuality(tier);
+    // A tier that was asked for is the tier that stays.
+    this.quality.locked = opts.quality !== undefined;
+
     this.renderer = new Renderer(canvas);
-    this.renderer.setPixelRatioCap(PIXEL_RATIO_CAP[opts.quality ?? 'high']);
+    this.renderer.setPixelRatioCap(QUALITY[tier].maxPixelRatio);
 
     this.scene = new THREE.Scene();
 
@@ -129,8 +146,6 @@ export class App {
     this.scene.add(this.sky.mesh);
 
     this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, NEAR_M, FAR_M);
-    this.camera.position.set(0, EXIT_ALTITUDE_M + LANDING_HEIGHT_M, 0);
-    this.camera.rotation.set(START_PITCH_RAD, 0, 0);
 
     // The world the terrain lives in. The floating origin moves it, so the
     // ground keeps its place while the camera stays near the origin.
@@ -142,7 +157,7 @@ export class App {
     // holds the heights and the terrain drapes the meshes over them.
     this.localFrame = new LocalFrame(opts.dz.lz);
     this.elevation = new ElevationGrid(this.localFrame);
-    this.cache = new TileCache();
+    this.cache = new TileCache({ maxEntries: CACHE_ENTRIES });
     this.terrain = new Terrain(
       this.world,
       this.localFrame,
@@ -151,12 +166,24 @@ export class App {
       this.cache,
       this.atmosphere,
       {
+        tau: QUALITY[tier].tau,
         anisotropy: Math.min(
-          ANISOTROPY_CAP[opts.quality ?? 'high'],
+          QUALITY[tier].anisotropy,
           this.renderer.gl.capabilities.getMaxAnisotropy(),
         ),
+        maxTextures: QUALITY[tier].maxTextures,
       },
     );
+
+    // The camera you fly with. Its position is the one in the scene, so the
+    // ground is sampled with the rebasing put back in.
+    this.freeCamera = new FreeCamera(this.camera, this.canvas, (x, z) =>
+      this.elevation.groundY(
+        x + this.floatingOrigin.offset.x,
+        z + this.floatingOrigin.offset.z,
+      ),
+    );
+    this.freeCamera.setPose(0, EXIT_ALTITUDE_M, 0, 0, START_PITCH_RAD);
 
     // The sun, for today in the drop zone's own time zone.
     this.sunDate = localTimeToDate(
@@ -168,15 +195,23 @@ export class App {
     this.atmosphere.setSun(sunDirectionLocal(this.sunDate, opts.dz.lz));
     this.atmosphere.setCameraY(this.camera.position.y);
 
-    this.loop = new Loop((_dt, now) => {
-      this.frame(now);
+    this.loop = new Loop((dt, now) => {
+      this.frame(dt, now);
     });
 
     // The debug handle: the terrain and the frame timings are one console
     // line away, without a build of the app.
     if (opts.debug) {
       (window as unknown as { __boogie?: unknown }).__boogie = this;
+
+      const ui = document.querySelector<HTMLElement>('#ui');
+      if (ui) {
+        this.hud = new DebugHud(ui);
+        this.hud.show(true);
+      }
     }
+
+    this.wireButtons();
 
     this.resize();
     window.addEventListener('resize', this.onResize);
@@ -192,10 +227,13 @@ export class App {
     this.loop.stop();
   }
 
-  private frame(now: number): void {
+  private frame(dt: number, now: number): void {
     // The world is rebased first: everything after it works with the camera's
     // true position in the local frame.
     this.floatingOrigin.update(this.camera);
+
+    // The camera flies.
+    this.freeCamera.update(dt);
 
     const started = performance.now();
     this.terrain.update(this.lodCamera(this.floatingOrigin.truePosition(this.camera)));
@@ -205,20 +243,128 @@ export class App {
     this.atmosphere.setCameraY(this.camera.position.y);
     this.renderer.render(this.scene, this.camera);
 
-    if (this.options.debug && now - this.lastDebugAt > 1000) {
-      this.lastDebugAt = now;
-      const stats = this.loop.stats();
-      const info = this.renderer.info();
-      const tiles = this.terrain.stats();
-      console.info(
-        `[boogie] ${stats.fps.toFixed(0)} fps, ${stats.frameMs.toFixed(1)} ms, ` +
-          `${info.calls} calls, ${info.triangles} triangles, ` +
-          `tiles ${tiles.visible}/${tiles.desired} shown, ${tiles.pending} pending, ` +
-          `update ${this.updateMsAvg.toFixed(1)} ms, ` +
-          `camera ${this.camera.position.y.toFixed(0)} m, ` +
-          `sun ${this.atmosphere.uniforms.uSunDir.value.toArray().map((n) => n.toFixed(2)).join(', ')}`,
-      );
+    // The tier watches the frame times: a phone that cannot keep up gives
+    // up the sharpness of the ground instead of the smoothness of the flight.
+    const changed = this.quality.pushFrame(this.loop.stats().frameMs, now);
+    if (changed) this.applyTier(changed);
+
+    if (this.options.debug) {
+      this.updateHud(now);
+
+      // The console line is the fallback for a page without the overlay.
+      if (!this.hud && now - this.lastDebugAt > 1000) {
+        this.lastDebugAt = now;
+        const stats = this.loop.stats();
+        const info = this.renderer.info();
+        const tiles = this.terrain.stats();
+        console.info(
+          `[boogie] ${stats.fps.toFixed(0)} fps, ${stats.frameMs.toFixed(1)} ms, ` +
+            `${info.calls} calls, ${info.triangles} triangles, ` +
+            `tiles ${tiles.visible}/${tiles.desired} shown, ${tiles.pending} pending, ` +
+            `update ${this.updateMsAvg.toFixed(1)} ms, ` +
+            `camera ${this.camera.position.y.toFixed(0)} m, ` +
+            `sun ${this.atmosphere.uniforms.uSunDir.value.toArray().map((n) => n.toFixed(2)).join(', ')}`,
+        );
+      }
     }
+  }
+
+  /**
+   * Show what the app is doing.
+   *
+   * The numbers of the old console line and the new ones: the tier, the
+   * screen, the tiles and where the camera is.
+   */
+  private updateHud(now: number): void {
+    const hud = this.hud;
+    if (!hud) return;
+    if (now - this.lastHudAt < HUD_INTERVAL_MS) return;
+    this.lastHudAt = now;
+
+    const stats = this.loop.stats();
+    const info = this.renderer.info();
+    const tiles = this.terrain.stats();
+    const truePosition = this.floatingOrigin.truePosition(this.camera);
+    const lonLat = this.localFrame.toLonLat(truePosition.x, truePosition.z);
+
+    hud.set({
+      fps: stats.fps.toFixed(0),
+      ms: stats.frameMs.toFixed(1),
+      tier: this.quality.tier,
+      dpr: this.devicePixelRatio().toFixed(2),
+      tiles: `${tiles.visible}/${tiles.desired} shown, ${tiles.pending} pending`,
+      calls: info.calls,
+      tris: info.triangles,
+      msl: `${this.camera.position.y.toFixed(0)} m`,
+      agl: `${this.freeCamera.agl.toFixed(0)} m`,
+      lon: lonLat.lon.toFixed(5),
+      lat: lonLat.lat.toFixed(5),
+      update: `${this.updateMsAvg.toFixed(1)} ms`,
+      sun: this.atmosphere.uniforms.uSunDir.value
+        .toArray()
+        .map((n) => n.toFixed(2))
+        .join(', '),
+    });
+  }
+
+  /**
+   * Take the tier the app is on.
+   *
+   * The renderer draws fewer pixels, the terrain is less sharp and the
+   * imagery is filtered less.
+   */
+  private applyTier(tier: QualityTier): void {
+    const settings = QUALITY[tier];
+    this.renderer.setPixelRatioCap(settings.maxPixelRatio);
+    this.terrain.setTau(settings.tau);
+    this.terrain.setAnisotropy(
+      Math.min(settings.anisotropy, this.renderer.gl.capabilities.getMaxAnisotropy()),
+    );
+  }
+
+  /**
+   * The buttons of the overlay: the exit altitude, the low pass and the
+   * ground, all above the landing area.
+   */
+  private wireButtons(): void {
+    for (const button of document.querySelectorAll<HTMLButtonElement>('#ui button[data-pose]')) {
+      const pose = button.dataset.pose;
+      button.addEventListener('click', () => {
+        if (pose === 'exit') {
+          this.goto(EXIT_ALTITUDE_M, -Math.PI / 3);
+        } else if (pose === 'low') {
+          this.goto(LOW_ALTITUDE_M, -Math.PI / 6);
+        } else {
+          this.goto(this.elevation.groundY(0, 0) + MIN_CLEARANCE_M, 0);
+        }
+      });
+    }
+  }
+
+  /**
+   * Put the camera above the landing area, at a height and a tilt.
+   *
+   * The landing area is the origin of the local frame, and the camera's own
+   * position is relative to the floating origin.
+   */
+  private goto(altitudeM: number, pitch: number): void {
+    this.freeCamera.setPose(
+      -this.floatingOrigin.offset.x,
+      altitudeM,
+      -this.floatingOrigin.offset.z,
+      0,
+      pitch,
+    );
+  }
+
+  /** The density of the screen. */
+  private devicePixelRatio(): number {
+    return window.devicePixelRatio || 1;
+  }
+
+  /** The number of cores the browser says the device has. */
+  private cores(): number {
+    return navigator.hardwareConcurrency || 4;
   }
 
   /**

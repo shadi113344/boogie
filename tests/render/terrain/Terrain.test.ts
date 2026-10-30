@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { Group } from 'three';
+import { Group, Texture } from 'three';
 import { LocalFrame, parentTile, tileKey } from '@/world/geo';
 import type { TileCoord } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
 import { TileCache } from '@/world/TileCache';
+import { imageryProviderForZoom, tileUrl } from '@/world/providers';
 import type { Atmosphere } from '@/render/Atmosphere';
 import { Terrain } from '@/render/terrain/Terrain';
 import { TerrainTile } from '@/render/terrain/TerrainTile';
@@ -366,5 +367,51 @@ describe('Terrain', () => {
 
     fixture.terrain.setAnisotropy(4);
     expect(fixture.terrain.quadtree.config.tau).toBe(2.5);
+  });
+
+  it('keeps the texture of a built tile when the cache evicts it', async () => {
+    const dispose = vi.spyOn(Texture.prototype, 'dispose');
+    const fixture = makeTerrain(makeCache());
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // The ground is on screen.
+    const meshes = fixture.world.children.length;
+    expect(meshes).toBeGreaterThan(0);
+
+    const visible = fixture.terrain.visibleTiles[0];
+    if (!visible) throw new Error('no visible tile');
+    const url = tileUrl(imageryProviderForZoom(visible.z), visible);
+
+    // The cache throws the imagery of that tile away.
+    fixture.cache.onEvict?.(url, { width: 0, height: 0 } as ImageBitmap);
+
+    // The mesh is still on screen and its texture is still alive.
+    expect(fixture.world.children.length).toBe(meshes);
+    expect(dispose).not.toHaveBeenCalled();
+
+    dispose.mockRestore();
+  });
+
+  it('disposes an unused texture when the cache evicts it', async () => {
+    const dispose = vi.spyOn(Texture.prototype, 'dispose');
+    const fixture = makeTerrain(makeCache(), { maxBuildsPerUpdate: 0 });
+
+    fixture.terrain.update(cameraAt(0, 4683, 0));
+    await settle(fixture.cache);
+
+    // No mesh was built, so no texture is in use.
+    expect(fixture.world.children.length).toBe(0);
+
+    const imagery = fixture.fetched.filter((url) => !isElevation(url));
+    const url = imagery[0];
+    if (!url) throw new Error('no imagery was fetched');
+
+    fixture.cache.onEvict?.(url, { width: 0, height: 0 } as ImageBitmap);
+
+    expect(dispose).toHaveBeenCalled();
+
+    dispose.mockRestore();
   });
 });

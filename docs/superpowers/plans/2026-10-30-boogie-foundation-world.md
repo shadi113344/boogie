@@ -631,7 +631,7 @@ it('findDropZone returns undefined for unknown ids', () => { expect(findDropZone
 
 ## Execution notes and milestone 2 findings (2026-10-30)
 
-All twelve tasks landed on `main` the same day, each as one MiniMax run reviewed and tested by the orchestrator, plus four follow-ups the review and the browser measurements called for: 9b (best-first refinement replaced the tau relaxation), 10b (imagery gated on elevation, paced mesh builds, faster ground sampling, debug handle), 10c (imagery gated on the finest elevation tile, cancellation of stale requests, a 192-tile cap on the elevation grid) and 10d (the fallback walk continues past ancestors whose elevation is not ready, so the coarse ring shows first). The live page is https://shadi113344.github.io/boogie/ and `?debug=1` adds the overlay, the three camera buttons and `window.__boogie`.
+All twelve tasks landed on `main` the same day, each as one MiniMax run reviewed and tested by the orchestrator, plus four follow-ups the review and the browser measurements called for: 9b (best-first refinement replaced the tau relaxation), 10b (imagery gated on elevation, paced mesh builds, faster ground sampling, debug handle), 10c (imagery gated on the finest elevation tile, cancellation of stale requests, a 192-tile cap on the elevation grid) 10d (the fallback walk continues past ancestors whose elevation is not ready, so the coarse ring shows first) and 10e (height ranges sampled from coarse elevation instead of inherited, only the root ring wanted until the first elevation tile arrives, the overlay's update time). The live page is https://shadi113344.github.io/boogie/ and `?debug=1` adds the overlay, the three camera buttons and `window.__boogie`.
 
 Measured in the desktop app's browser pane (Intel Iris Xe, 1024×768, pixel ratio 1), which caps animation frames at 30 per second and is therefore not a frame-rate instrument:
 
@@ -642,7 +642,7 @@ Measured in the desktop app's browser pane (Intel Iris Xe, 1024×768, pixel rati
 
 Carried into Plan 2 (milestones 3 and 4), in priority order:
 
-1. Top-down elevation: treat a tile with an unknown height range as a leaf until its elevation arrives instead of assuming 0 to 5,000 m, so the selection refines progressively and elevation requests are bounded by the final selection (today up to 192 tiles and about 20 MB on a cold start).
+1. Elevation economy: a leaf coarser than zoom 14 fetches its own coarse elevation tile even when the grid already holds finer or coarser tiles covering it, and a tier change re-selects at other zooms and fetches again, so a cold start still fills the 192-tile cap (614 loads for 141 leaves at Hinton, 220 of them imagery). Prefer any loaded tile within two zoom levels, and request elevation only for leaves that survive two consecutive selections.
 2. Adaptive quality against the measured refresh interval, with adaptation held while tiles are still being built.
 3. Prefetch of the landing-area cone and the jump run before exit (milestone 5 in the spec, but the cold-start numbers argue for doing the landing-area part earlier).
 4. The overlay's `update ms` line; the exit button follows the drop zone's `exitAltitudeFt`.

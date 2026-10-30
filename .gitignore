@@ -4,3 +4,5 @@ dist/
 .impeccable/
 *.log
 .DS_Store
+.vite/
+coverage/

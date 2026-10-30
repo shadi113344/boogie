@@ -24,7 +24,7 @@ export interface DropZone {
   lz: LonLat;
   /** The radius of the landing area, in metres. */
   lzRadiusM: number;
-  /** The height the jump is made from, in feet above mean sea level. */
+  /** The height the jump is made from, in feet above the ground. */
   exitAltitudeFt: number;
   /** The units the drop zone's country measures in. */
   units: 'ft' | 'm';

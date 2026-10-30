@@ -8,6 +8,9 @@
  */
 
 import * as THREE from 'three';
+import { JumpAudio } from '@/audio/JumpAudio';
+import { DEFAULT_CANOPY, type CanopyId } from '@/data/canopies';
+import type { DropZone } from '@/data/dropzones';
 import { Renderer } from '@/render/Renderer';
 import { Atmosphere } from '@/render/Atmosphere';
 import { Sky } from '@/render/Sky';
@@ -16,32 +19,39 @@ import { FreeCamera } from '@/render/FreeCamera';
 import { Terrain } from '@/render/terrain/Terrain';
 import type { LodCamera } from '@/render/terrain/TerrainQuadtree';
 import { DebugHud } from '@/ui/DebugHud';
+import { StartScreen, type ControlScheme } from '@/ui/StartScreen';
 import { Loop } from './Loop';
 import { AdaptiveQuality, QUALITY, defaultTier } from './Quality';
 import type { QualityTier } from './Quality';
+import { JumpSession, type JumpHost } from './JumpSession';
+import { clampBodyMass, DEFAULT_JUMPER } from '@/sim/jumper';
+import { formatAltitude, formatSpeed } from '@/sim/units';
+import { WIND_PRESETS, type WindProfile } from '@/sim/wind';
 import { localDayInZone, localTimeToDate, sunDirectionLocal } from '@/world/sun';
 import { LocalFrame } from '@/world/geo';
-import type { LonLat } from '@/world/geo';
 import { ElevationGrid } from '@/world/ElevationGrid';
 import { TileCache } from '@/world/TileCache';
 
 export interface AppOptions {
   /** The drop zone: where it is, its time zone and its exit altitude. */
-  dz: { lz: LonLat; timeZone: string; exitAltitudeFt: number };
+  dz: DropZone;
   /** The hour of the day, local to the drop zone. */
   hourLocal: number;
   /** Developer overlay and console logging. */
   debug: boolean;
   /** Quality tier. A given tier is locked; without one the tier adapts. */
   quality?: QualityTier;
+  /** Plan 1's free camera, with no jump: the camera flies on its own. */
+  free?: boolean;
+  /** The wind over the drop zone. */
+  wind?: WindProfile;
+  /** The body mass of the jumper, in kilograms. */
+  bodyMassKg?: number;
+  /** The canopy the jumper flies. */
+  canopyId?: CanopyId;
+  /** The seed of the jump. */
+  seed?: number;
 }
-
-/**
- * The exit height: 13,500 ft. The camera parks at it above mean sea level
- * while it waits for the ground, and the exit button puts it at that height
- * above the landing area.
- */
-const EXIT_ALTITUDE_M = 4115;
 
 /** One thousand feet: the low pass over the drop zone. */
 const LOW_ALTITUDE_M = 305;
@@ -55,6 +65,22 @@ const FOV_DEG = 60;
 /** Near and far planes, in metres. The horizon is over 200 km away. */
 const NEAR_M = 1;
 const FAR_M = 600000;
+
+/**
+ * The near and far planes of the overlay, in metres.
+ *
+ * The watch on the wrist is a third of a metre from the eye, which the
+ * near plane of the world would cut away, so the instruments are drawn in
+ * a pass of their own with a near plane of its own.
+ */
+const OVERLAY_NEAR_M = 0.01;
+const OVERLAY_FAR_M = 10;
+
+/** How many tiles may still be on their way before the jump is offered. */
+const READY_PENDING_TILES = 15;
+
+/** How long the app waits for the ground before it offers the jump anyway. */
+const READY_TIMEOUT_MS = 20000;
 
 /** Downward tilt of the parked camera, in radians. */
 const START_PITCH_RAD = -Math.PI / 4;
@@ -100,10 +126,14 @@ const CACHE_ENTRIES = 512;
  */
 const EXIT_SAMPLE_ZOOM = 10;
 
-export class App {
+export class App implements JumpHost {
   readonly renderer: Renderer;
   readonly scene: THREE.Scene;
   readonly camera: THREE.PerspectiveCamera;
+
+  /** The scene and the camera of the first-person instruments. */
+  readonly overlay: { scene: THREE.Scene; camera: THREE.PerspectiveCamera };
+
   readonly atmosphere: Atmosphere;
   readonly sky: Sky;
   readonly loop: Loop;
@@ -135,9 +165,36 @@ export class App {
   /** The instant the sun was computed for. */
   readonly sunDate: Date;
 
+  /** The window the app is in. */
+  readonly window: Window = globalThis.window;
+
+  /** Where the controls and the cards of the app go. */
+  readonly uiRoot: HTMLElement;
+
+  /** True when the developer overlay is on. */
+  readonly debug: boolean;
+
+  /** The height of the landing area above mean sea level, in metres. */
+  lzGroundY = 0;
+
   private readonly canvas: HTMLCanvasElement;
 
   private readonly options: AppOptions;
+
+  /** True when the app flies Plan 1's free camera, with no jump. */
+  private readonly freeMode: boolean;
+
+  /** The screen before the jump, when the app is flying a jump. */
+  private readonly startScreen: StartScreen | null;
+
+  /** The jump in progress, when there is one. */
+  private session: JumpSession | null = null;
+
+  /** The sound of the jump, made when the jumper taps the button. */
+  audio?: JumpAudio;
+
+  /** The seed of the jump, and the one of the next jump after it. */
+  private nextSeed: number;
 
   /** The developer overlay, when the app was started in debug mode. */
   private readonly hud: DebugHud | null = null;
@@ -167,6 +224,12 @@ export class App {
   /** True once the refresh of the display has been measured and handed over. */
   private refreshMeasured = false;
 
+  /** True while the overlay is showing the lines of a jump. */
+  private jumpLinesShown = false;
+
+  /** When the app started, on the clock of the frame loop. */
+  private readonly startedAt = performance.now();
+
   /**
    * The zoom of the elevation the exit pose was placed from, -1 for none.
    *
@@ -178,6 +241,9 @@ export class App {
   constructor(canvas: HTMLCanvasElement, opts: AppOptions) {
     this.canvas = canvas;
     this.options = opts;
+    this.debug = opts.debug;
+    this.freeMode = opts.free === true;
+    this.nextSeed = opts.seed ?? Math.floor(Math.random() * 0x7fffffff);
 
     // The tier the app starts on: the one that was asked for, or the one the
     // device can be trusted with. A phone is never trusted with the high
@@ -199,6 +265,14 @@ export class App {
     this.scene.add(this.sky.mesh);
 
     this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, NEAR_M, FAR_M);
+
+    // The instruments of the first person: the watch on the wrist, drawn in
+    // a pass of its own, because the camera of the world has a near plane
+    // a metre away and the watch is a third of a metre from the eye.
+    this.overlay = {
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(FOV_DEG, 1, OVERLAY_NEAR_M, OVERLAY_FAR_M),
+    };
 
     // The world the terrain lives in. The floating origin moves it, so the
     // ground keeps its place while the camera stays near the origin.
@@ -239,7 +313,7 @@ export class App {
     );
     // The camera parks at the exit height, looking down, until the ground
     // under the landing area is known: the exit is a height above it.
-    this.freeCamera.setPose(0, EXIT_ALTITUDE_M, 0, 0, START_PITCH_RAD);
+    this.freeCamera.setPose(0, exitAltitudeM(opts.dz), 0, 0, START_PITCH_RAD);
 
     // The sun, for today in the drop zone's own time zone.
     this.sunDate = localTimeToDate(
@@ -255,6 +329,21 @@ export class App {
       this.frame(dt, now);
     });
 
+    // The layer the controls and the cards go on.
+    this.uiRoot = document.querySelector<HTMLElement>('#ui') ?? this.makeUiRoot();
+
+    // The screen before the jump, over the parked camera.
+    if (this.freeMode) {
+      this.startScreen = null;
+    } else {
+      this.startScreen = new StartScreen(this.uiRoot, {
+        dzName: opts.dz.name,
+        units: opts.dz.units,
+      });
+      this.startScreen.onJump = (scheme) => this.startJump(scheme);
+      this.wireAudioGesture();
+    }
+
     // The debug handle: the terrain and the frame timings are one console
     // line away, without a build of the app.
     if (opts.debug) {
@@ -264,17 +353,47 @@ export class App {
       const buttons = document.querySelector<HTMLElement>('#camera-buttons');
       if (buttons) buttons.removeAttribute('hidden');
 
-      const ui = document.querySelector<HTMLElement>('#ui');
-      if (ui) {
-        this.hud = new DebugHud(ui);
-        this.hud.show(true);
-      }
+      this.hud = new DebugHud(this.uiRoot);
+      this.hud.show(true);
     }
 
     this.wireButtons();
 
     this.resize();
     window.addEventListener('resize', this.onResize);
+  }
+
+  /** The layer the app draws its own things on, when the page has none. */
+  private makeUiRoot(): HTMLElement {
+    const root = document.createElement('div');
+    root.id = 'ui';
+    document.body.appendChild(root);
+    return root;
+  }
+
+  /**
+   * Starts the sound of the jump from the tap on the jump button.
+   *
+   * The browser only lets a context make a noise inside the gesture of the
+   * tap, so the context is made and started here, in the capture phase of
+   * the click, before the start screen asks for anything.
+   */
+  private wireAudioGesture(): void {
+    this.uiRoot.addEventListener(
+      'click',
+      (event) => {
+        const target = event.target as Element | null;
+        if (!target?.closest?.('[data-action="jump"]')) return;
+        void this.ensureAudio().resume();
+      },
+      true,
+    );
+  }
+
+  /** The sound of the jump, made the first time it is needed. */
+  private ensureAudio(): JumpAudio {
+    this.audio ??= new JumpAudio();
+    return this.audio;
   }
 
   /** Start the frame loop. */
@@ -293,25 +412,37 @@ export class App {
     this.frameCount += 1;
     this.measureRefresh(dt);
 
+    // The jump comes first: it samples the controls, moves the simulation
+    // and puts the camera where the jumper's eye is.
+    if (this.session) {
+      this.session.frame(dt);
+    } else {
+      // The camera flies.
+      this.freeCamera.update(dt);
+    }
+
     // The world is rebased first: everything after it works with the camera's
     // true position in the local frame.
     this.floatingOrigin.update(this.camera);
-
-    // The camera flies.
-    this.freeCamera.update(dt);
 
     const started = performance.now();
     this.terrain.update(this.lodCamera(this.floatingOrigin.truePosition(this.camera)));
     this.measureUpdate(performance.now() - started, now);
 
-    // The exit pose waits for the ground: the camera is put at the exit
-    // height above the landing area, and put there again for every finer
-    // sample of the ground under it.
-    this.placeAtExit();
+    if (!this.session) {
+      // The exit pose waits for the ground: the camera is put at the exit
+      // height above the landing area, and put there again for every finer
+      // sample of the ground under it.
+      this.placeAtExit();
+      this.updateReadiness(now);
+    }
 
     this.sky.update(this.camera.position);
     this.atmosphere.setCameraY(this.camera.position.y);
     this.renderer.render(this.scene, this.camera);
+
+    // The instruments of the first person go over the world.
+    if (this.session) this.renderer.renderOverlay(this.overlay.scene, this.overlay.camera);
 
     // The tier watches the frame times: a phone that cannot keep up gives
     // up the sharpness of the ground instead of the smoothness of the flight.
@@ -398,6 +529,114 @@ export class App {
         .map((n) => n.toFixed(2))
         .join(', '),
     });
+
+    // The lines of the jump: where the jumper is and what they are doing.
+    const session = this.session;
+    if (session) {
+      const jump = session.jump;
+      const units = this.options.dz.units;
+      hud.set({
+        phase: jump.phase,
+        agl: formatAltitude(jump.altitudeAglM(), units),
+        vspeed: formatSpeed(-jump.velocity().y, units),
+        fallRate: session.input.freefall.fallRate.toFixed(2),
+        heading: `${((session.headingRad * 180) / Math.PI).toFixed(0)}°`,
+      });
+      this.jumpLinesShown = true;
+    } else if (this.jumpLinesShown) {
+      // The jump is over: the lines of the jump are emptied, so nothing
+      // stale is left on the screen.
+      hud.set({
+        phase: '-',
+        agl: `${this.freeCamera.agl.toFixed(0)} m`,
+        vspeed: '-',
+        fallRate: '-',
+        heading: '-',
+      });
+      this.jumpLinesShown = false;
+    }
+  }
+
+  /**
+   * Says whether the ground under the landing area is ready for a jump.
+   *
+   * The jump is offered when the ground under the landing area is known at
+   * zoom ten or finer and the tiles have nearly all arrived, or after
+   * twenty seconds, when the ground is good enough to jump over even if it
+   * is not complete.
+   */
+  private updateReadiness(now: number): void {
+    const screen = this.startScreen;
+    if (!screen) return;
+
+    const sample = this.elevation.sample(this.options.dz.lz);
+    if (sample) this.lzGroundY = sample.height;
+
+    const pending = this.terrain.stats().pending;
+    const groundKnown = sample !== null && sample.zoom >= EXIT_SAMPLE_ZOOM;
+    const waited = now - this.startedAt >= READY_TIMEOUT_MS;
+    const ready = (groundKnown && pending < READY_PENDING_TILES) || waited;
+
+    screen.setLoading(ready ? null : `Loading the ground: ${pending} tiles to go`);
+    screen.setReady(ready);
+  }
+
+  /**
+   * The jump begins.
+   *
+   * The tap on the jump button is the gesture the browser wants before the
+   * sound may start, so the sound is started here as well as in the
+   * gesture itself.
+   */
+  private startJump(scheme: ControlScheme): void {
+    if (this.session) return;
+
+    void this.ensureAudio().resume();
+
+    // The free camera has had its turn: the jumper's eye is in the scene
+    // now, and the fingers of the free camera must not move it.
+    this.freeCamera.dispose();
+
+    const session = new JumpSession(this, {
+      dz: this.options.dz,
+      jumper: {
+        bodyMassKg: clampBodyMass(this.options.bodyMassKg ?? DEFAULT_JUMPER.bodyMassKg),
+        gearMassKg: DEFAULT_JUMPER.gearMassKg,
+      },
+      wind: this.options.wind ?? WIND_PRESETS.typical,
+      canopyId: this.options.canopyId ?? DEFAULT_CANOPY,
+      seed: this.nextSeed,
+      scheme,
+    });
+    session.onEnd = () => this.endJump();
+    this.session = session;
+
+    // The goggle vignette goes on with the jump.
+    document.querySelector('#vignette')?.removeAttribute('hidden');
+    this.startScreen?.show(false);
+  }
+
+  /** The jump is over: the session is let go and the start screen comes back. */
+  private endJump(): void {
+    this.session?.dispose();
+    this.session = null;
+    // The next jump is a different jump: the seed moves on.
+    this.nextSeed = (this.nextSeed + 1) % 0x7fffffff;
+    // The camera goes back to the exit, over the landing area.
+    this.exitSampleZoom = -1;
+    document.querySelector('#vignette')?.setAttribute('hidden', '');
+    this.startScreen?.setLoading(null);
+    this.startScreen?.show(true);
+  }
+
+  /** Where the world has been rebased to, in metres. */
+  originOffset(): { x: number; z: number } {
+    return { x: this.floatingOrigin.offset.x, z: this.floatingOrigin.offset.z };
+  }
+
+  /** The height of the ground at a place in the local frame, in metres. */
+  groundY(x: number, z: number): number {
+    return this.elevation.groundY(x, z);
   }
 
   /**
@@ -444,8 +683,19 @@ export class App {
   /**
    * The buttons of the overlay: the exit altitude, the low pass and the
    * ground, all above the landing area.
+   *
+   * The exit is the drop zone's own exit height, and the buttons say so in
+   * the units of the drop zone.
    */
   private wireButtons(): void {
+    const units = this.options.dz.units;
+
+    const exit = document.querySelector<HTMLButtonElement>('#pose-exit');
+    if (exit) exit.textContent = formatAltitude(exitAltitudeM(this.options.dz), units);
+
+    const low = document.querySelector<HTMLButtonElement>('#pose-low');
+    if (low) low.textContent = formatAltitude(LOW_ALTITUDE_M, units);
+
     for (const button of document.querySelectorAll<HTMLButtonElement>('#ui button[data-pose]')) {
       const pose = button.dataset.pose;
       button.addEventListener('click', () => {
@@ -453,7 +703,7 @@ export class App {
         // it is read at the moment of the click.
         const ground = this.elevation.groundY(0, 0);
         if (pose === 'exit') {
-          this.goto(ground + EXIT_ALTITUDE_M, -Math.PI / 3);
+          this.goto(ground + exitAltitudeM(this.options.dz), -Math.PI / 3);
         } else if (pose === 'low') {
           this.goto(ground + LOW_ALTITUDE_M, -Math.PI / 6);
         } else {
@@ -547,6 +797,10 @@ export class App {
     const height = this.canvas.clientHeight || window.innerHeight || 1;
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
+    // The overlay is drawn with the same view of the world, so it has the
+    // same shape of picture.
+    this.overlay.camera.aspect = width / height;
+    this.overlay.camera.updateProjectionMatrix();
   }
 }
 

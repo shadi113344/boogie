@@ -55,6 +55,22 @@ export class Renderer {
     this.gl.render(scene, camera);
   }
 
+  /**
+   * Draw the first-person instruments over the world.
+   *
+   * The watch on the wrist is a third of a metre from the eye, and the
+   * camera of the world has a near plane a metre away, so the watch is
+   * drawn in a pass of its own: the depth is cleared and the colour is
+   * not, so the instruments sit over the world without touching it.
+   */
+  renderOverlay(scene: THREE.Scene, camera: THREE.Camera): void {
+    const gl = this.gl;
+    gl.autoClear = false;
+    gl.clearDepth();
+    gl.render(scene, camera);
+    gl.autoClear = true;
+  }
+
   /** What the last frame cost. */
   info(): RenderInfo {
     return {
